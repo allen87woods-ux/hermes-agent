@@ -97,6 +97,27 @@ _LONG_LIVED_FOREGROUND_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"\bpython(?:3)?\s+-m\s+http\.server\b",
 ))
 
+# Launchers that return to the shell immediately: a server started THROUGH one of these never
+# occupies the foreground, so it must not be classified as a long-lived foreground command.
+_SELF_DETACHING_LAUNCHER_RE = re.compile(
+    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)\s*(?:systemd-run|start-stop-daemon)\b",
+    re.IGNORECASE,
+)
+
+
+def _long_lived_foreground_hit(command: str) -> bool:
+    """True when *command* would itself block on a long-lived server/watch process.
+
+    The pattern match is a substring test, so it fires for server commands nested inside a
+    wrapper. That matters: promoting on a substring promoted an entire compound command
+    wholesale (observed 2026-09-18: a `systemd-run ... python -m http.server` verification
+    compound was backgrounded in full, discarding the checks that followed it). A launcher that
+    detaches on its own returns immediately, so those commands are left in the foreground.
+    """
+    if _SELF_DETACHING_LAUNCHER_RE.search(command):
+        return False
+    return any(p.search(command) for p in _LONG_LIVED_FOREGROUND_PATTERNS)
+
 # Kinds returned by ``_foreground_background_verdict``.
 #
 # ``shell_bg`` / ``amp_bg`` name a command the tool cannot rewrite safely: a detached
@@ -131,7 +152,7 @@ _FOREGROUND_GUIDANCE: tuple[tuple[Any, str, str], ...] = (
         "health checks and tests in follow-up terminal calls.",
     ),
     (
-        lambda s: any(p.search(s) for p in _LONG_LIVED_FOREGROUND_PATTERNS),
+        _long_lived_foreground_hit,
         GUIDANCE_LONG_LIVED,
         "This command starts a long-lived server/watch process and the call did not set "
         "\"background\": true, so it was started as a tracked background session instead "

@@ -140,3 +140,33 @@ class TestLongLivedPromotion:
         # Two identical calls produce two sessions: the identical-call streak that ended the
         # incident run can no longer accumulate from this command.
         assert first["session_id"] != second["session_id"]
+
+
+class TestLauncherSubstringFalsePositive:
+    """A server command nested in a self-detaching launcher must stay in the foreground.
+
+    The long-lived patterns are substring tests, so `systemd-run ... python -m http.server`
+    matched and the ENTIRE compound command was promoted to the background, silently discarding
+    the verification commands that followed it in the same call (observed 2026-09-18).
+    """
+
+    def test_systemd_run_wrapped_server_is_not_flagged(self):
+        cmd = ("systemd-run --user --unit=x --collect /home/al/.hermes/hermes-agent/venv/bin/python "
+               "-m http.server 8090 --bind 100.120.198.121")
+        assert _foreground_background_verdict(cmd) is None
+
+    def test_compound_verification_command_is_not_flagged(self):
+        """The exact shape that discarded its own verification output."""
+        cmd = ("systemd-run --user --unit=demo --collect python3 -m http.server 8090; sleep 2; "
+               "systemctl --user is-active demo; curl -s http://127.0.0.1:8090/")
+        assert _foreground_background_verdict(cmd) is None
+
+    def test_plan_does_not_promote_launcher_wrapped_command(self):
+        cmd = "systemd-run --user --unit=x python3 -m http.server 8090"
+        plan = _plan_execution(cmd, task_id=None, timeout=None, background=False, _host_local=True)
+        assert plan.promoted_from_long_lived_foreground is False
+
+    def test_bare_server_command_is_still_flagged(self):
+        """The fix must not disarm the real case."""
+        assert _foreground_background_verdict(INCIDENT_COMMAND)[0] == GUIDANCE_LONG_LIVED
+        assert _foreground_background_verdict("pnpm dev")[0] == GUIDANCE_LONG_LIVED

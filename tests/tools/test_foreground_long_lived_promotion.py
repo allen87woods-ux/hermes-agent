@@ -91,7 +91,7 @@ class TestRefusalNamesWhatArrived:
         msg = _foreground_background_guidance("nohup ./worker.sh > /dev/null 2>&1")
         assert 'arrived without "background": true' in msg
         assert "WITHOUT the wrapper" in msg
-        assert "notify_on_complete=true" in msg
+        assert "notify=true" in msg
 
 
 class TestLongLivedPromotion:

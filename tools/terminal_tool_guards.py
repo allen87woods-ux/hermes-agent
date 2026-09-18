@@ -119,7 +119,7 @@ _FOREGROUND_GUIDANCE: tuple[tuple[Any, str, str], ...] = (
         GUIDANCE_SHELL_BG,
         "This call arrived without \"background\": true, and the command uses shell-level "
         "background wrappers (nohup/disown/setsid). Re-send WITHOUT the wrapper as "
-        "terminal(command=\"<cmd>\", background=true, notify_on_complete=true) so Hermes "
+        "terminal(command=\"<cmd>\", background=true, notify=true) so Hermes "
         "tracks the process, then run readiness checks and tests in separate commands.",
     ),
     (
@@ -127,7 +127,7 @@ _FOREGROUND_GUIDANCE: tuple[tuple[Any, str, str], ...] = (
         GUIDANCE_AMP_BG,
         "This call arrived without \"background\": true, and the command uses '&' "
         "backgrounding. Re-send WITHOUT the '&' as terminal(command=\"<cmd>\", "
-        "background=true) — add notify_on_complete=true for bounded jobs — then run "
+        "background=true) — add notify=true for bounded jobs — then run "
         "health checks and tests in follow-up terminal calls.",
     ),
     (

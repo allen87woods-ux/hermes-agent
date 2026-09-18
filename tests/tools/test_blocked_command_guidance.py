@@ -75,7 +75,11 @@ class TestBackgroundGuidanceRecipes:
         msg = _foreground_background_guidance("nohup ./worker.sh > /dev/null 2>&1")
         assert msg is not None
         assert "WITHOUT the wrapper" in msg
-        assert "notify_on_complete=true" in msg
+        # Must name the ADVERTISED schema parameter (`notify`), not the unadvertised
+        # legacy alias `notify_on_complete`: a small model cannot look up a key its
+        # schema does not show, and the incident turn shows it hunting exactly here.
+        assert "notify=true" in msg
+        assert "notify_on_complete" not in msg
 
     def test_plain_command_unaffected(self):
         assert _foreground_background_guidance("echo hello") is None

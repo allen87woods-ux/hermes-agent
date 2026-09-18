@@ -992,6 +992,12 @@ def _plan_execution(
             if kind != GUIDANCE_LONG_LIVED:
                 raise _Rejected(_error_json(guidance, status="error"))
             promoted_server = True
+            # Logged so the real rate stays measurable: promotion deliberately stops refusing,
+            # which also stops the caller's omission of `background` from being visible anywhere else.
+            logger.info(
+                "Promoted long-lived foreground command to a background session: %s",
+                _safe_command_preview(command),
+            )
         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
             promoted = timeout
 

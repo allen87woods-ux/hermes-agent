@@ -746,7 +746,8 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 
 from tools.terminal_tool_guards import (
-    _foreground_background_guidance, _safe_command_preview, _validate_workdir,
+    GUIDANCE_LONG_LIVED, _foreground_background_guidance, _foreground_background_verdict,
+    _safe_command_preview, _validate_workdir,
     gateway_lifecycle_block, self_repo_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
@@ -896,6 +897,10 @@ class _ExecPlan:
     # tracked background process instead of being refused (the requested seconds, for the note).
     promoted_from_foreground_timeout: Optional[int] = None
 
+    # Set when a foreground call was a plain long-lived server/watch invocation: promoted to a
+    # tracked background session instead of refused (no command rewrite is needed for those).
+    promoted_from_long_lived_foreground: bool = False
+
 
 _PROMOTED_NOTE = (
     "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
@@ -967,17 +972,26 @@ def _plan_execution(
     if timeout is not None and timeout <= 0:
         raise _Rejected(tool_error(f"timeout must be a positive number of seconds (got {timeout})."))
     promoted = None
+    promoted_server = False
     if not background:
         # An over-cap foreground timeout is a bounded job the caller wants to wait for (test suites,
         # builds). Refusing it only bought a mechanical retry: 454 refusals in one run, every one
         # re-sent lower/split/background. Promote to a tracked background process instead; the
-        # caller is told in the result. The `&`/nohup/server guidance below stays a refusal: those
-        # need the command itself rewritten, which the tool cannot do safely.
+        # caller is told in the result.
+        # A plain long-lived server/watch invocation gets the same treatment: it needs no command
+        # rewrite, so refusing it only bought an identical retry. The caller cannot see that its
+        # own emitted call omitted `background`, so a refusal that says "use background=true"
+        # repeats until the identical-call guardrail stops the run.
+        # `&`/nohup/setsid stay refusals: those need the command itself rewritten, which the tool
+        # cannot do safely.
         # The detachment guidance applies whether or not the call is promoted: a promoted `cmd &`
-        # would start a tracked shell that exits at once while its payload runs untracked.
-        guidance = _foreground_background_guidance(command)
-        if guidance:
-            raise _Rejected(_error_json(guidance, status="error"))
+        # would start a tracked shell that exits at once while its payload ran untracked.
+        verdict = _foreground_background_verdict(command)
+        if verdict is not None:
+            kind, guidance = verdict
+            if kind != GUIDANCE_LONG_LIVED:
+                raise _Rejected(_error_json(guidance, status="error"))
+            promoted_server = True
         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
             promoted = timeout
 
@@ -985,6 +999,7 @@ def _plan_execution(
         config=config, env_type=env_type, effective_task_id=effective_task_id,
         image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=timeout or config["timeout"],
         promoted_from_foreground_timeout=promoted,
+        promoted_from_long_lived_foreground=promoted_server,
     )
 
 
@@ -1007,6 +1022,28 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
         return result_json
     template = _PROMOTED_NOTE if data.get("notify_on_complete") else _PROMOTED_NOTE_POLL_ONLY
     data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=FOREGROUND_MAX_TIMEOUT)
+    return json.dumps(data, ensure_ascii=False)
+
+
+_PROMOTED_SERVER_NOTE = (
+    "This call did not set \"background\": true and the command starts a long-lived "
+    "server/watch process, so it was started as a tracked background session instead of "
+    "being refused. Do NOT re-run it. A server never exits, so no completion notification "
+    "arrives: verify readiness with a follow-up call (curl or a health check), read its log "
+    "with process(action=\"log\", session_id=...), and stop it with "
+    "process(action=\"kill\", session_id=...)."
+)
+
+
+def _with_server_promoted_note(result_json: str) -> str:
+    """Attach the long-lived-foreground promotion note to a spawn result (unchanged on error)."""
+    try:
+        data = json.loads(result_json)
+    except (TypeError, ValueError):
+        return result_json
+    if not isinstance(data, dict) or data.get("error"):
+        return result_json
+    data["promoted_from_foreground"] = _PROMOTED_SERVER_NOTE
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -1226,10 +1263,15 @@ def terminal_tool(
         verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
+        server_promoted = plan.promoted_from_long_lived_foreground
         if plan.promoted_from_foreground_timeout is not None:
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
+        elif server_promoted:
+            # A server never exits, so notify_on_complete would never fire: keep the session silent
+            # (matching the schema guidance for daemons) and let the caller poll it.
+            background, notify_on_complete, watch_patterns = True, False, None
         if background:
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
@@ -1240,6 +1282,8 @@ def terminal_tool(
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
+            elif server_promoted:
+                result = _with_server_promoted_note(result)
             return result
         return _run_foreground(
             command, env, plan,

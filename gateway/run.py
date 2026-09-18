@@ -5215,6 +5215,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _start_gateway_configure_logging(verbosity)
 
     runner = GatewayRunner(config)
+    # Local patch 2026-09-18: keep a long-lived gateway from serving boot-time
+    # code forever. Watches the checkout fingerprint and asks for the gateway's
+    # own graceful restart (drain -> exit 75 -> systemd respawn, the /restart
+    # path) once no work is in flight. See gateway/code_skew_reload.py.
+    try:
+        from gateway.code_skew_reload import start_code_skew_watcher
+
+        start_code_skew_watcher(runner)
+    except Exception as _skew_exc:
+        logger.warning("code-skew reload watcher unavailable: %s", _skew_exc)
     # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
     # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
     # See #82936.

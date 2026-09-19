@@ -107,6 +107,11 @@ DEFAULT_CONFIG = {
         # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
         # failover to fallback providers; raise to tolerate longer provider hiccups.
         "api_max_retries": 3,
+        # Seconds the Codex/Responses stream may keep reading after its terminal frame so the relay
+        # finalizer can run. Relays that never close the SSE socket after response.completed would
+        # otherwise wedge the turn until the idle watchdog discards the already-billed response
+        # (#103864). 0 skips the drain. Well-behaved endpoints close immediately and never wait this long.
+        "stream_drain_timeout": 2.0,
         # Empty-response retry guard. Empty retries re-send the full input at full price; this stops
         # re-billing deterministic empties (unsignaled refusals, zero output tokens) while failing
         # open on ambiguous evidence (missing usage, any tokens, model/provider change).
@@ -709,8 +714,11 @@ DEFAULT_CONFIG = {
         # OpenAI-compatible request fields. Vision: download_timeout = image HTTP download (s).
         "vision": _aux(120, download_timeout=30),
         # web_extract and session_search no longer use an aux LLM; leftover blocks in user config
-        # are ignored. Compression: raise timeout for local models.
-        "compression": _aux(120),
+        # are ignored. Compression: raise timeout for local models. no_progress_timeout
+        # (Codex/Responses streams only): seconds without a substantive event before the stream
+        # fails fast; None = built-in 60s default. Independent of "timeout" (the overall request
+        # budget) — raising "timeout" alone does not widen this window. See #108104.
+        "compression": _aux(120, no_progress_timeout=None),
         "skills_hub": _aux(30),
         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
@@ -913,7 +921,9 @@ DEFAULT_CONFIG = {
         # Per-platform: display.platforms.<platform>.runtime_footer.
         "runtime_footer": {
             "enabled": False,
-            "fields": ["model", "context_pct", "cwd"],  # order shown; drop any to hide
+            # order shown; drop any to hide. Opt-in extras: latency, served_model (alias → the
+            # deployment a routing proxy reported / Hermes' fallback route).
+            "fields": ["model", "context_pct", "cwd"],
         },
         # CLI/TUI status bar fields. Non-empty = only listed fields show (built-in order kept,
         # config controls visibility not ordering); empty = default set. Available: model,
@@ -1034,6 +1044,9 @@ DEFAULT_CONFIG = {
             # gpt-4o-mini-tts voices: alloy, ash, ballad, cedar, coral, echo, fable, marin, nova,
             # onyx, sage, shimmer, verse
             "voice": "alloy",
+            # Forwarded verbatim in the request body for OpenAI-compatible servers whose cloned
+            # voices demand it (400 consent_required otherwise); "" sends nothing.
+            "consent_attestation": "",
         },
         "gemini": {
             "model": "gemini-2.5-flash-preview-tts",
@@ -1118,6 +1131,8 @@ DEFAULT_CONFIG = {
             # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
             "model": "whisper-1",
             "language": "",  # auto-detect; set "en", "es", ... to force
+            "timeout": 60,  # seconds; allow self-hosted backends time to cold-start
+            "max_retries": 1,  # OpenAI SDK transport retries
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
@@ -1308,6 +1323,10 @@ DEFAULT_CONFIG = {
         # Orchestrator role controls. Depth floored at 1, no ceiling; each level multiplies cost.
         "max_spawn_depth": 1,  # 1 = flat, 2 = orchestrator→leaf, 3+ = deeper
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # Total subagents a finite one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited.
+        # Each child re-pays a cold system prompt and re-explores the repo, and one-shot spawns are mostly
+        # "review my own work" rather than parallel work (agent/oneshot_footprint.py).
+        "oneshot_max_children": 2,
         # Subagent threads ALWAYS resolve approvals non-interactively (the parent TUI owns stdin;
         # input() from a worker would deadlock). false = auto-deny, true = auto-approve "once"; both
         # log a warning audit line. true only for trusted batch work.

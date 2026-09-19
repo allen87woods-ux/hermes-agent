@@ -168,6 +168,11 @@ _NONRETRYABLE_COPY: Dict[str, str] = {
         "{label}'s account settings don't allow this model for your request, so it didn't "
         "answer. Check the provider's data/privacy settings, or switch models with /model."
     ),
+    FailoverReason.upstream_blocked.value: (
+        "A firewall/CDN in front of {label} blocked the request before it reached the model, so "
+        "your key is probably fine. Set a custom User-Agent via the provider's extra_headers, check "
+        "the proxy/WAF rules, or switch providers with /model."
+    ),
 }
 _NONRETRYABLE_DEFAULT_COPY = (
     "{label} rejected the request and retrying won't help. Pick another model with /model, "
@@ -202,6 +207,7 @@ FAILURE_CAUSE_GLOSS: Dict[str, str] = {
     "billing_unverified": "the AI model service says the account's usage or credit limit is reached",
     FailoverReason.auth.value: "the AI model service rejected the sign-in",
     FailoverReason.auth_permanent.value: "the AI model service rejected the sign-in",
+    FailoverReason.upstream_blocked.value: "a firewall/CDN in front of the AI model service blocked the request",
     FailoverReason.model_not_found.value: "the model {subject} uses was not found at the AI model service",
     FailoverReason.content_policy_blocked.value: "the AI model service's safety filter rejected the request",
     "context_overflow": "{possessive} request grew too large for the model",
@@ -301,11 +307,18 @@ def site_copy(code: str, **fields: Any) -> str:
     return _SITE_COPY[code].format_map(_Defaults(fields))
 
 
-def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str) -> str:
-    """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``)."""
+def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None) -> str:
+    """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
+    limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401)."""
     lead = _EXHAUSTED_LEADS.get(reason, _EXHAUSTED_DEFAULT_LEAD).format(label=label, attempts=attempts)
+    if reset_seconds is not None and reset_seconds >= 120:
+        from agent.retry_utils import format_reset_window
+        situation = (f"its usage limit resets in {format_reset_window(reset_seconds)}. "
+                     "Send /retry after that, or switch models with /model.")
+    else:
+        situation = f"it looks temporarily unavailable. {_NEXT_STEPS_RETRY}"
     return (
-        f"{lead} — it looks temporarily unavailable. {_NEXT_STEPS_RETRY} To avoid this in future, "
+        f"{lead} — {situation} To avoid this in future, "
         f"add a backup provider with `hermes fallback add`.\n\nProvider said: {summary}"
     )
 

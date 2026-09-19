@@ -38,6 +38,7 @@ class FailoverReason(enum.Enum):
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
     upstream_rate_limit = "upstream_rate_limit"  # Aggregator's upstream model 429 — fallback model, key is healthy
+    upstream_blocked = "upstream_blocked"  # 403 from a WAF/CDN/proxy in front of the provider — key is healthy, fallback
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
@@ -49,6 +50,7 @@ class FailoverReason(enum.Enum):
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator account data/privacy policy excluded the only endpoint
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — don't retry unchanged
+    model_entitlement = "model_entitlement"  # This account cannot use the requested model — rotate credential (model-scoped), else fall back
     format_error = "format_error"        # 400 bad request — abort or strip + retry
     role_alternation = "role_alternation"  # Strict chat template rejected adjacent same-role messages — merge them for this destination and retry
     invalid_encrypted_content = "invalid_encrypted_content"  # Responses replay blob rejected — strip replay state and retry
@@ -260,6 +262,9 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 
 # Last entry: OpenRouter 404 when no endpoint supports tool calling —
 # model_not_found triggers fallback instead of burning retries (#58446).
+# Codex ChatGPT-account entitlement 400 — the account can never use the named slug (#71970, #106475).
+CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER = "model is not supported when using codex with a chatgpt account"
+
 _MODEL_NOT_FOUND_PATTERNS = (
     "is not a valid model", "invalid model", "model not found", "model_not_found", "does not exist",
     "no such model", "unknown model", "unsupported model", "no endpoints found that support tool use",
@@ -348,6 +353,9 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = (
 _AUTH_PATTERNS = (
     "invalid api key", "invalid_api_key", "gateway_auth_failed", "authentication", "unauthorized",
     "forbidden", "invalid token", "token expired", "token revoked", "access denied",
+    # Codex backend rejecting an OAuth access token without a usable
+    # ``chatgpt_account_id`` claim; arrives as a bare ``detail`` string.
+    "failed to extract accountid from token",
 )
 
 # Empty-response advisories (OpenRouter / nano-gpt). Checked before overflow
@@ -409,6 +417,17 @@ _SSL_TRANSIENT_PATTERNS = (
 )
 
 
+# A 403 body written by a WAF/CDN/proxy rather than the provider's API: Cloudflare's browser
+# challenge and block pages, plus the plain-text block relays return when they reject the SDK
+# User-Agent (#53099). Matched only on 403 (see ``_status_403``); a bare "access denied" or
+# "forbidden" stays auth because providers word real permission errors that way too.
+_UPSTREAM_BLOCKED_PATTERNS = (
+    "your request was blocked", "request blocked", "sorry, you have been blocked",
+    "enable javascript and cookies to continue", "cdn-cgi/challenge-platform", "cf-browser-verification",
+    "challenge-error-text", "__cf_chl", "cf-error-details", "attention required! | cloudflare",
+)
+
+
 # ── Verdicts and rule tables ────────────────────────────────────────────
 # A verdict is the ClassifiedError kwargs a stage decided on: ``reason`` plus
 # hint overrides (unlisted hints keep dataclass defaults). Rule tables are
@@ -431,7 +450,10 @@ _V_RATE_LIMIT = _v(_R.rate_limit, **_ROTATE_FALLBACK)
 _V_AUTH_ROTATE = _v(_R.auth, retryable=False, **_ROTATE_FALLBACK)
 _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
+_V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
 _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
+# Another account in the same pool may hold the entitlement; the credential itself is healthy.
+_V_MODEL_ENTITLEMENT = _v(_R.model_entitlement, retryable=False, **_ROTATE_FALLBACK)
 _V_FORMAT_ERROR = _v(_R.format_error, **_ABORT_FALLBACK)
 # A different provider (direct instead of the aggregator; another host's TLS chain) can fix these.
 _V_POLICY_BLOCKED = _v(_R.provider_policy_blocked, **_ABORT_FALLBACK)
@@ -587,6 +609,19 @@ _ERROR_CODE_VERDICTS: Dict[str, Verdict] = {
     "invalid_encrypted_content": _V_INVALID_ENCRYPTED,
 }
 
+# Provider-native status codes that arrive as a bare ``{"error": {"code": …}}`` body
+# (no HTTP status, no prose): gRPC canonical names from Gemini, Anthropic error
+# types, OpenAI's ``server_error``. Scoped per provider so a coincidentally named
+# code from another backend stays ``unknown`` (#70414). Provider aliases collapse
+# to the family key before lookup.
+_PROVIDER_CODE_FAMILIES = {"openai-codex": "openai", "google": "gemini", "google-gemini": "gemini",
+                           "google-ai-studio": "gemini", "vertex": "gemini", "google-vertex": "gemini"}
+_PROVIDER_CODE_VERDICTS: Dict[str, Dict[str, Verdict]] = {
+    "openai": {"server_error": _V_SERVER_ERROR},
+    "gemini": {"unavailable": _V_OVERLOADED, "deadline_exceeded": _V_TIMEOUT, "internal": _V_SERVER_ERROR},
+    "anthropic": {"api_error": _V_SERVER_ERROR, "rate_limit_error": _V_RATE_LIMIT},
+}
+
 # Generic ``invalid_request_error`` is deliberately NOT a 400 validation
 # signal — OpenAI stamps it on genuine overflow 400s too.
 _400_VALIDATION_CODES = {"unknown_parameter", "unsupported_parameter"}
@@ -714,6 +749,11 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # ``codex_reasoning_items`` — a genuine block with nothing to strip behaves as before.
     if _is_codex_masked_replay_rejection(c):
         return _v(_R.invalid_encrypted_content, **_ABORT_FALLBACK)
+    # OpenAI Responses rejects a stale encrypted-reasoning replay with this code (#70595). It contains
+    # both "thinking" and "signature", so it must beat the Anthropic heuristic below: that recovery
+    # strips Anthropic thinking blocks and resends the same encrypted item forever.
+    if status == 400 and (c.code == "thinking_signature_invalid" or "thinking_signature_invalid" in msg):
+        return _V_INVALID_ENCRYPTED
     # Anthropic thinking-block 400s (signature mismatch after transcript
     # mutation). Not gated on provider — OpenRouter proxies Anthropic errors.
     if status == 400 and "thinking" in msg and any(p in msg for p in _THINKING_MUTATION_WORDS):
@@ -728,9 +768,12 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # retry loop strips them. Exclude the Qwen/vLLM "No user query found" error
     # local engines wrap as "Unable to generate parser for this template" —
     # that is a poisoned transcript (→ format_error), not a grammar problem.
+    # Strict OpenAI-compatible schema validators reject regex lookaround in ``pattern``
+    # with a different sentence ("Invalid JSON schema: regex lookaround is not supported",
+    # #42631); same recovery — strip ``pattern``/``format`` and retry once.
     grammar_hit = "error parsing grammar" in msg or "json-schema-to-grammar" in msg or (
         "unable to generate parser" in msg and "template" in msg
-    )
+    ) or ("invalid json schema" in msg and "regex lookaround" in msg and "not supported" in msg)
     if status == 400 and grammar_hit and _NO_USER_QUERY_SIGNAL not in msg:
         return _v(_R.llama_cpp_grammar_pattern)
     # xAI Grok entitlement as an SSE ``type=error`` frame: no status, matches no
@@ -756,7 +799,11 @@ def _by_error_code(c: _Ctx) -> Optional[Verdict]:
     # HTTP 200: retrying cannot succeed, a configured fallback still may.
     if c.code == PROVIDER_STREAM_NON_JSON_ERROR_CODE and "request validation failed:" in c.msg:
         return _V_FORMAT_ERROR
-    return _ERROR_CODE_VERDICTS.get(c.code)
+    verdict = _ERROR_CODE_VERDICTS.get(c.code)
+    if verdict is None:
+        family = _PROVIDER_CODE_FAMILIES.get(c.provider_slug, c.provider_slug)
+        verdict = _PROVIDER_CODE_VERDICTS.get(family, {}).get(c.code)
+    return verdict
 
 
 def _by_message(c: _Ctx) -> Optional[Verdict]:
@@ -869,11 +916,26 @@ def _off_route_host(c: _Ctx) -> str:
 
 # ── Status code handlers ────────────────────────────────────────────────
 
+# Structured codes some gateways put on a 403 that mean "the upstream is down,
+# retry later" — not a credential refusal (#75388). Checked before the auth
+# default so the configured retry budget applies and no credential is benched.
+_403_TRANSIENT_CODES = frozenset({"upstream_unavailable"})
+
+
 def _status_403(c: _Ctx) -> Verdict:
+    if c.code in _403_TRANSIENT_CODES:
+        return _V_OVERLOADED
     # OpenRouter 403 "key limit exceeded" and similar plan/credit exhaustion are billing.
     xai_spend = c.provider_slug == "xai-oauth" and c.code == _XAI_SPENDING_LIMIT_ERROR_CODE
     billing = xai_spend or any(p in c.msg for p in ("key limit exceeded", "spending limit") + _BILLING_PATTERNS)
-    return _V_BILLING if billing else _V_AUTH_FALLBACK
+    if billing:
+        return _V_BILLING
+    # A WAF/CDN in front of the provider answered, not the provider: the credential never
+    # reached it, so key guidance and credential rotation are wrong (#53099, #70566). Gated on
+    # 403 and on established block/challenge markers; any other 403 stays auth.
+    if any(p in c.msg for p in _UPSTREAM_BLOCKED_PATTERNS):
+        return _V_UPSTREAM_BLOCKED
+    return _V_AUTH_FALLBACK
 
 
 def _status_404(c: _Ctx) -> Verdict:
@@ -911,6 +973,10 @@ def _status_429(c: _Ctx) -> Verdict:
     explicit_rate_limit = any(p in c.msg for p in _RATE_LIMIT_PATTERNS)
     if quota_wall and not explicit_rate_limit and not _has_usage_limit_transient_signal(c.msg, c.body, c.headers):
         return _V_BILLING
+    # Carry the reset window so the terminal copy can name it instead of "wait a minute" (#89401).
+    reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+    if reset:
+        return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
     return _V_RATE_LIMIT
 
 
@@ -977,6 +1043,10 @@ def _classify_400(c: _Ctx) -> Verdict:
     verdict = _first_match(msg, _IMAGE_TOOL_RULES)
     if verdict is not None:
         return verdict
+    # Codex ChatGPT-account model rejection: exact normalized text only, so arbitrary 400s never
+    # rotate. Before request-validation, whose "not supported" wording would abort as format_error (#71970).
+    if CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER in msg:
+        return _V_MODEL_ENTITLEMENT
     # Invalid encrypted reasoning replay blob (OpenAI Responses); before
     # overflow because "encrypted content … could not be verified" trips it.
     if code == "invalid_encrypted_content" or "invalid_encrypted_content" in msg or (
@@ -1074,6 +1144,24 @@ def _has_usage_limit_transient_signal(error_msg: str, body: dict, response_heade
     return False
 
 
+def _rate_limit_reset_seconds(error_msg: str, body: dict, response_headers) -> Optional[float]:
+    """Seconds until a 429's window reopens, from the body's reset fields, ``Retry-After`` or the
+    message grammar (``retry after Ns`` / ``resets in 4hr``); None when the response names none."""
+    from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
+    for payload in (p for p in (body, _error_obj(body)) if isinstance(p, dict)):
+        for name in _RESET_FIELDS:
+            value = payload.get(name)
+            if value in (None, ""):
+                continue
+            if name.endswith("_at") and isinstance(value, (int, float)):
+                return max(0.0, float(value) - time.time())
+            if (seconds := parse_retry_after_seconds(value)) is not None:
+                return seconds
+    if (seconds := parse_retry_after_seconds(response_headers)) is not None:
+        return seconds
+    return reset_delay_from_message(error_msg)
+
+
 def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
     """True when a bare model id is only known to the provider as ``vendor/id``.
 
@@ -1104,16 +1192,24 @@ def _is_server_injected_param_rejection(error_msg: str, provider: str) -> bool:
 
 
 _CODEX_MASKED_REPLAY_MESSAGE = "request blocked."
+_CODEX_UNSUPPORTED_CONTENT_DETAIL = "unsupported content type"
 
 
 def _is_codex_masked_replay_rejection(c: "_Ctx") -> bool:
     """HTTP 400 / status-less ``{code: invalid_prompt, message: "Request blocked."}`` from
     ``openai-codex`` — as an SDK error body, a Responses ``error`` SSE frame, or the
-    ``response.failed`` text ``"invalid_prompt: Request blocked."``."""
+    ``response.failed`` text ``"invalid_prompt: Request blocked."`` — or the bare
+    ``{"detail": "Unsupported content type"}`` envelope the same backend returns for a rejected
+    encrypted-reasoning replay (#51512). Both are exact envelopes, provider-gated."""
     if c.provider_slug != "openai-codex" or c.status_code not in (None, 400):
         return False
+    body = c.body if isinstance(c.body, dict) else {}
+    if str(body.get("detail") or "").strip().lower() == _CODEX_UNSUPPORTED_CONTENT_DETAIL or (
+        not body and _CODEX_UNSUPPORTED_CONTENT_DETAIL in c.msg and "detail" in c.msg
+    ):
+        return True
     # The OpenAI SDK unwraps ``body["error"]`` on status errors; stream frames keep the envelope.
-    body_msg = next((str(m).strip().lower() for m in _body_message_candidates(c.body or {}) if m), "")
+    body_msg = next((str(m).strip().lower() for m in _body_message_candidates(body) if m), "")
     return (c.code == "invalid_prompt" and body_msg == _CODEX_MASKED_REPLAY_MESSAGE) or (
         c.msg.strip() == f"invalid_prompt: {_CODEX_MASKED_REPLAY_MESSAGE}"
     )
@@ -1161,12 +1257,18 @@ def _build_error_msg(error: Exception, body: Any) -> str:
 
 
 def _body_message_candidates(body: dict) -> Iterator[Any]:
-    """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy shapes)."""
+    """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy, FastAPI shapes)."""
     yield _error_obj(body).get("message")
     yield body.get("message")
     yield body.get("errorMessage")
     args = body.get("errorArgs")
     yield args.get("reason") if isinstance(args, dict) else None
+    # FastAPI/Starlette relays and the Codex gateway answer {"detail": "..."} (or a nested
+    # OpenAI-ish object); without it a descriptive rejection reads as a bare 400 and the
+    # large-session heuristic sends it into compression (#81558). A list here is pydantic's
+    # validation shape, read by _oversized_message_content_rejection.
+    detail = body.get("detail")
+    yield detail.get("message") if isinstance(detail, dict) else detail if isinstance(detail, str) else None
 
 
 def _from_cause_chain(error: Exception, pick: Callable[[Any], Any], default: Any) -> Any:
@@ -1221,12 +1323,16 @@ def _extract_error_body(error: Exception) -> dict:
 def _code_from_payload(payload: Any, top_keys: Sequence[str], peek_message: bool) -> str:
     """Code/type from ``payload.error`` or a top-level key; ``"400"`` is not a code.
     ``peek_message`` also parses a JSON ``error.message`` for a nested code
-    (Responses API surfaces ``invalid_encrypted_content`` this way)."""
+    (Responses API surfaces ``invalid_encrypted_content`` this way). Gemini
+    puts the HTTP status in ``error.code`` and the symbolic code
+    (``UNAVAILABLE``) in ``error.status``, so a numeric code defers to it."""
     if not isinstance(payload, dict):
         return ""
     error_obj = payload.get("error", {})
     if isinstance(error_obj, dict):
         code = error_obj.get("code") or error_obj.get("type") or ""
+        if not isinstance(code, str):
+            code = error_obj.get("status") or code
         if isinstance(code, str) and code.strip() and code.strip() != "400":
             return code.strip()
         message = error_obj.get("message")

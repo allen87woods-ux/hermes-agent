@@ -114,6 +114,13 @@ All SSE streams (Chat Completions, Responses, `/api/sessions/{id}/chat/stream`, 
 - **Chat Completions**: Hermes emits `event: hermes.tool.progress` for tool-start visibility without polluting persisted assistant text.
 - **Responses**: Hermes emits spec-native `function_call` and `function_call_output` output items during the SSE stream, so clients can render structured tool UI in real time.
 
+**Model reasoning** (emitted only when the model actually produces reasoning and the resolved `reasoning` config allows it; the input-side opt-out is `model_options.reasoning.enabled: false`):
+- **Chat Completions**: reasoning deltas arrive as `choices[0].delta.reasoning_content` chunks (the DeepSeek-style field Open WebUI, opencode and the Vercel AI SDK render as a thinking block); answer text stays in `delta.content`.
+- **Responses**: each thinking burst is a spec-native `reasoning` output item — `response.output_item.added` (`item.type: "reasoning"`), `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta` … `response.reasoning_summary_text.done`, `response.reasoning_summary_part.done`, `response.output_item.done` — closed before the next message or `function_call` item opens, and echoed in the `response.completed` output as `{"id": "rs_…", "type": "reasoning", "status": "completed", "summary": [{"type": "summary_text", "text": "…"}]}`. `sequence_number` stays monotonic across reasoning, text and tool events.
+- **Non-streaming**: `/v1/chat/completions` returns the turn's reasoning on `choices[0].message.reasoning_content`; `/v1/responses` returns the same `reasoning` output item(s) ahead of the message (and of that step's `function_call` items), also on `GET /v1/responses/{id}` replay.
+- Echoing a prior response's `output` list back as the next `input` (what Responses SDK clients do) is fine: `reasoning` items are ignored on input rather than parsed as empty user turns.
+- Support is advertised as `features.reasoning_streaming: true` on `GET /v1/capabilities`.
+
 ### POST /v1/responses
 
 OpenAI Responses API format. Supports server-side conversation state via `previous_response_id` — the server stores full conversation history (including tool calls and results) so multi-turn context is preserved without the client managing it.
@@ -254,7 +261,8 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
-    "run_stop": true
+    "run_stop": true,
+    "reasoning_streaming": true
   }
 }
 ```
@@ -465,9 +473,12 @@ Poll the current run state. This is useful for dashboards that need status witho
   "session_id": "space-session",
   "model": "hermes-agent",
   "output": "Done.",
-  "usage": {"input_tokens": 50, "output_tokens": 200, "total_tokens": 250}
+  "usage": {"input_tokens": 50, "output_tokens": 200, "total_tokens": 250, "cache_read_tokens": 40, "cache_write_tokens": 0},
+  "runtime": {"provider": "openai", "model": "gpt-5", "route_source": "global"}
 }
 ```
+
+`model` echoes what the request asked for. On a completed run, `runtime` is the provider/model pair that actually served the turn — after a [fallback provider](fallback-providers.md) switch it names the fallback pair, so a cost-attribution poller books the run to the right provider. `usage.cache_read_tokens` / `usage.cache_write_tokens` are the session's prompt-cache reads and writes, so cached input is not priced as full-price input. `runtime` has the same shape as on `/v1/chat/completions` and `/v1/responses`: `route_source` says how the runtime was chosen (`global`, `raw_request`, `model_routes`), and a request that named a `model`/`provider` also gets `requested: {provider, model}` so the asked-for and served pairs can be compared. The `run.completed` event on the events stream carries the same `usage` and `runtime` fields.
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, `cancelled`, or `interrupted`) for polling and UI reconciliation. When the gateway shuts down while a run is active, the run is persisted as `interrupted` (error `Gateway shutdown interrupted the run.`, terminal event `run.interrupted`) before the agent is asked to stop, so a durable run never survives a restart as `running`; a late result from the interrupted turn cannot overwrite it.
 

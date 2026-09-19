@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
 from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
-from agent.error_classifier import FailoverReason
+from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_sanitization import (
     _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates, _sanitize_structure_non_ascii, _sanitize_structure_surrogates,
@@ -380,6 +380,49 @@ def _refresh_credentials_after_401(
         _print_anthropic_401_diagnostics(agent, agent._anthropic_api_key)
     return False
 
+
+def _is_codex_token_expired(agent: Any, api_error: Exception) -> bool:
+    """401 ``token_expired`` from the Codex backend (#88510). It rejects a stale replayed
+    ``encrypted_content`` blob with this auth signature, so a persisted session loops on "sign
+    in again" while a fresh session on the same bearer works. The caller treats it like
+    ``invalid_encrypted_content`` — but only while cached reasoning items remain to strip."""
+    if getattr(api_error, "status_code", None) != 401:
+        return False
+    reason = agent._extract_api_error_context(api_error).get("reason")
+    return isinstance(reason, str) and reason.strip().lower() == "token_expired"
+
+
+def _recover_stale_codex_reasoning(agent: Any, _retry: TurnRetryState, messages: List[Dict[str, Any]]) -> bool:
+    """Stale ``codex_reasoning_items`` blob rejected by the provider: disable replay for the
+    session, strip cached items (mutates persisted ``messages``), retry once."""
+    if (
+        _retry.invalid_encrypted_content_retry_attempted
+        or agent.api_mode != "codex_responses"
+        or not bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
+        or not any(
+            isinstance(_m, dict)
+            and _m.get("role") == "assistant"
+            and isinstance(_m.get("codex_reasoning_items"), list)
+            and _m.get("codex_reasoning_items")
+            for _m in messages
+        )
+    ):
+        return False
+    _retry.invalid_encrypted_content_retry_attempted = True
+    replay_stats = agent._disable_codex_reasoning_replay(messages)
+    _vlines(
+        agent,
+        f"⚠️  Encrypted reasoning replay was rejected by the provider — "
+        f"disabled replay and stripped {replay_stats['items']} item(s) from "
+        f"{replay_stats['messages']} message(s), retrying...",
+    )
+    logger.warning(
+        "%sInvalid encrypted reasoning recovery: disabled replay and stripped %d items from %d messages",
+        agent.log_prefix, replay_stats["items"], replay_stats["messages"],
+    )
+    return True
+
+
 def _recover_format_errors(
     agent: Any, api_error: Exception, classified: Any, _retry: TurnRetryState,
     messages: List[Dict[str, Any]], api_messages: Any,
@@ -405,33 +448,11 @@ def _recover_format_errors(
         )
         return True
 
-    # 400 ``invalid_encrypted_content`` on a stale ``codex_reasoning_items`` blob:
-    # disable replay for the session, strip cached items, retry once.
-    if (
-        classified.reason == FailoverReason.invalid_encrypted_content
-        and not _retry.invalid_encrypted_content_retry_attempted
-        and agent.api_mode == "codex_responses"
-        and bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
-        and any(
-            isinstance(_m, dict)
-            and _m.get("role") == "assistant"
-            and isinstance(_m.get("codex_reasoning_items"), list)
-            and _m.get("codex_reasoning_items")
-            for _m in messages
-        )
+    # 400 ``invalid_encrypted_content`` on a stale ``codex_reasoning_items`` blob (the 401
+    # ``token_expired`` twin is taken ahead of the credential pool in the caller).
+    if classified.reason == FailoverReason.invalid_encrypted_content and _recover_stale_codex_reasoning(
+        agent, _retry, messages
     ):
-        _retry.invalid_encrypted_content_retry_attempted = True
-        replay_stats = agent._disable_codex_reasoning_replay(messages)
-        _vlines(
-            agent,
-            f"⚠️  Encrypted reasoning replay was rejected by the provider — "
-            f"disabled replay and stripped {replay_stats['items']} item(s) from "
-            f"{replay_stats['messages']} message(s), retrying...",
-        )
-        logger.warning(
-            "%sInvalid encrypted reasoning recovery: disabled replay and stripped %d items from %d messages",
-            agent.log_prefix, replay_stats["items"], replay_stats["messages"],
-        )
         return True
 
     # Structured 400 naming ``context_management``: disable native compaction for the
@@ -539,13 +560,21 @@ def recover_after_classification(
 ) -> Tuple[bool, bool]:
     """One-shot recovery chain that runs AFTER ``classify_api_error`` and before the
     generic retry path. Order is load-bearing (each branch may ``return`` early):
-    Nous paid-entitlement refresh → credential-pool rotation → image shrink →
-    multimodal-tool-content strip → corrupt-image strip → Anthropic OAuth 1M-beta
-    disable → per-provider 401 credential refresh → format-recovery strips.
+    Nous paid-entitlement refresh → Codex stale-reasoning strip on 401 ``token_expired`` →
+    credential-pool rotation → image shrink → multimodal-tool-content strip → corrupt-image
+    strip → Anthropic OAuth 1M-beta disable → per-provider 401 credential refresh →
+    format-recovery strips.
     Returns ``(retry_now, recovered_with_pool)``; the latter feeds the Nous rate-limit guard."""
     from agent.conversation_loop import _is_nous_inference_route
 
     if _recover_welcome_tier(agent, classified, _retry):
+        return True, False
+
+    # 401 ``token_expired`` while the transcript still carries ``codex_reasoning_items`` is a
+    # stale replayed blob far more often than a dead bearer (#88510): strip BEFORE the pool
+    # refreshes/benches every healthy entry over a session-state problem. A real expiry pays
+    # one extra round-trip and then takes the credential path below as before.
+    if _is_codex_token_expired(agent, api_error) and _recover_stale_codex_reasoning(agent, _retry, messages):
         return True, False
 
     if (
@@ -798,6 +827,7 @@ def _welcome_outage_copy(base_url: Any, classified: Any, *, anonymous: bool = Fa
 # Terminal status label per non-retryable reason (default names the HTTP status).
 _NONRETRYABLE_LABELS = {
     FailoverReason.content_policy_blocked: "The provider's safety filter refused this request",
+    FailoverReason.upstream_blocked: "A firewall/CDN in front of the provider blocked this request",
     FailoverReason.ssl_cert_verification: "The provider's security certificate could not be verified",
     # Only reached after the one-shot image shrink ran (recover_after_classification sets the flag first).
     FailoverReason.image_too_large: "Request still exceeded the provider's size limit after shrinking images",
@@ -860,6 +890,16 @@ def nonretryable_client_error_result(
             _vlines(agent, f"      Did you mean '{_prefix_suggestion}'? It looks like the vendor prefix is missing.")
     elif classified.reason not in _NONRETRYABLE_LABELS:
         _vlines(agent, f"   💡 Fix: pick another model (/model), or check `{display_hermes_home()}/logs/agent.log`.")
+    # A WAF/CDN block (#53099, #70566): the key never reached the provider; the usual cause
+    # is the SDK User-Agent, which the per-provider extra_headers override.
+    if classified.reason == FailoverReason.upstream_blocked:
+        _vlines(
+            agent,
+            "   💡 The endpoint's firewall/CDN blocked the request before it reached the model — your key",
+            "      and model access are probably fine. Relays often reject the SDK's default User-Agent:",
+            "      set `extra_headers: {User-Agent: HermesAgent/1.0}` on the custom_providers entry,",
+            "      or check the proxy/WAF rules and your network.",
+        )
     # Content-policy blocks: the provider refused this prompt, so recovery is a rephrase
     # or another model, not key/retry advice.
     if classified.reason == FailoverReason.content_policy_blocked:
@@ -1023,9 +1063,10 @@ def max_retries_exhausted_result(
     else:
         # Every surface reads final_response (the 💡 lines above are CLI-only), so the chat
         # text carries the plain what-happened + next step itself.
+        _reset_at = classified.error_context.get("reset_at")
         _final_response = exhausted_copy(
             classified.reason.value, label=provider_label_for(provider), attempts=max_retries,
-            summary=_final_summary,
+            summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
         )
         if _welcome_hint:
             _final_response = _welcome_tier_guidance(classified, model=model, in_chat=True)
@@ -1064,22 +1105,28 @@ def max_retries_exhausted_result(
 def log_api_error_attempt(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int,
     status_code: Optional[int], elapsed_time: float, api_messages: Any, approx_tokens: int,
+    retryable: bool = True,
 ) -> Tuple[str, str, Any, Any, Any]:
     """Log one failed API attempt (warning + buffered retry trace, OpenRouter "no tool
     endpoints" hint, bare-404 missing-vendor-prefix hint); the buffer only surfaces if every
-    retry+fallback exhausts. Returns ``(error_type, error_msg, provider, base_url, model)``."""
+    retry+fallback exhausts. Returns ``(error_type, error_msg, provider, base_url, model)``.
+
+    ``retryable=False`` (the classifier's verdict, e.g. a 401 on a static-key route) is
+    named on the line: a bare ``attempt 1/3`` promises a second attempt that never comes
+    and sends readers hunting for a retry bug (#73237)."""
     error_type = type(api_error).__name__
     error_msg = str(api_error).lower()
     _error_summary = agent._summarize_api_error(api_error)
+    _attempt = f"attempt {retry_count}/{max_retries}" + ("" if retryable else ", not retryable")
     logger.warning(
-        "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
-        retry_count, max_retries, error_type, agent._client_log_context(), _error_summary,
+        "API call failed (%s) error_type=%s %s summary=%s",
+        _attempt, error_type, agent._client_log_context(), _error_summary,
     )
 
     _provider = getattr(agent, "provider", "unknown")
     _base = getattr(agent, "base_url", "unknown")
     _model = getattr(agent, "model", "unknown")
-    _blines(agent, f"⚠️  Attempt {retry_count}/{max_retries} failed: {_error_summary}")
+    _blines(agent, f"⚠️  {_attempt[0].upper()}{_attempt[1:]} failed: {_error_summary}")
     # Exception class, endpoint, raw body and token counts are developer detail: verbose only.
     if getattr(agent, "verbose_logging", False):
         _status_code_str = f" [HTTP {status_code}]" if status_code else ""
@@ -1438,6 +1485,24 @@ def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_fail
     if is_transport_failure:
         return "⚠️ Provider unreachable — switching to fallback provider..."
     return "⚠️ Rate limited — switching to fallback provider..."
+
+
+def activate_codex_app_server_fallback(agent: Any, result: Dict[str, Any]) -> bool:
+    """The codex app-server runtime reports a failed turn as ``result["error"]`` text instead of
+    raising, so the generic classify -> ``fallback_providers`` chain never saw it (#71633).
+    Classify that text; on a billing / rate-limit verdict activate the configured fallback and
+    return True so the caller re-runs the same user turn on the generic loop."""
+    error = result.get("error")
+    if not error or result.get("interrupted") or not agent._has_pending_fallback():
+        return False
+    classified = classify_api_error(
+        RuntimeError(str(error)), provider=getattr(agent, "provider", "") or "", model=getattr(agent, "model", "") or "",
+    )
+    if classified.reason not in _RATE_LIMIT_REASONS:
+        return False
+    agent._buffer_diagnostic_status(
+        _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False))
+    return bool(agent._try_activate_fallback(reason=classified.reason))
 
 
 def _is_genuine_nous_rate_limit(agent: Any, api_error: Exception, error_context: Any, classified: Any = None) -> bool:

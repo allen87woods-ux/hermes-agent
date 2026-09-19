@@ -69,6 +69,7 @@ _STATIC_FEATURE_FLAGS = {
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
+    "reasoning_streaming": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
@@ -1084,6 +1085,16 @@ except Exception:  # pragma: no cover - scanner is optional hardening
 class _ProviderAuthResolutionError(RuntimeError):
     """Provider credential resolution failed. Typed so callers never mislabel other
     RuntimeErrors from run_conversation() (e.g. a closed OpenAI client) as auth failures."""
+
+    def user_text(self) -> str:
+        """Raw-surface failure line. A quota/429 cap with valid credentials must not be labelled an
+        authentication failure — the cause chain (RuntimeError -> AuthError) tells them apart (#89401)."""
+        from hermes_cli.auth import is_rate_limited_auth_error
+
+        cause = self.__cause__
+        cause = getattr(cause, "__cause__", None) if isinstance(cause, RuntimeError) else cause
+        label = "Provider rate-limited" if is_rate_limited_auth_error(cause) else "Provider authentication failed"
+        return f"⚠️ {label}: {self}"
 
 
 class _SessionEventQueue:
@@ -2147,7 +2158,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _create_agent(
         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
         stream_delta_callback=None, tool_progress_callback=None, tool_start_callback=None,
-        tool_complete_callback=None, gateway_session_key: Optional[str] = None,
+        tool_complete_callback=None, reasoning_callback=None, gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None, requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
@@ -2200,6 +2211,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
+            "reasoning_callback": reasoning_callback,
             "session_db": self._ensure_session_db(),
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
@@ -3731,7 +3743,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self, user_message: str, conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
         stream_delta_callback=None, tool_progress_callback=None, tool_start_callback=None,
-        tool_complete_callback=None, agent_ref: Optional[list] = None, active_run_id: Optional[str] = None,
+        tool_complete_callback=None, reasoning_callback=None, agent_ref: Optional[list] = None,
+        active_run_id: Optional[str] = None,
         gateway_session_key: Optional[str] = None, requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None, model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None, session_model: Optional[str] = None,
@@ -3771,6 +3784,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
                         stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
+                        reasoning_callback=reasoning_callback,
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
@@ -3816,10 +3830,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 except _ProviderAuthResolutionError as exc:
                     # Typed provider-auth failure only, handled once for every caller in
                     # run.py's response shape (text, no HTTP error).
-                    logger.warning("Provider authentication failed for session=%s: %s",
+                    logger.warning("Provider resolution failed for session=%s: %s",
                                    session_id or "", exc)
                     return (
-                        {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [],
+                        {"final_response": exc.user_text(), "messages": [],
                          "api_calls": 0, "tools": [],
                          **({"_notification_presentation_suppressed": True} if muted else {})},
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})

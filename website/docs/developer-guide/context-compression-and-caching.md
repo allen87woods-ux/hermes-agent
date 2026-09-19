@@ -175,7 +175,14 @@ A failed or stalled summary attempt arms a per-session **failure cooldown**
 (escalating 60s → 300s → 900s, never shorter than
 `compression.context_timeout_seconds`, persisted in `state.db`). While it is
 armed, ordinary threshold-triggered compaction is deferred so a broken summary
-backend does not re-fire every turn. Three paths run a real attempt anyway:
+backend does not re-fire every turn. Timeouts and stalls escalate on one
+counter; a summary that ends in `finish_reason=length` (output cap hit, the
+transcript is preserved) escalates on its own counter along the same
+60s → 300s → 900s rungs, so a later turn — such as an async delegation
+completion arriving after the cooldown lapsed — cannot re-issue the same
+capped request every 30 seconds (#69637). JSON-decode, closed-stream and
+empty-content failures stay on a flat 30 s cooldown. Three paths run a real
+attempt anyway:
 
 - Manual `/compress` (`force=True`) — clears the cooldown and retries.
 - The same-turn `fallback_chain` retry after a stalled primary route — the
@@ -197,6 +204,14 @@ backend does not re-fire every turn. Three paths run a real attempt anyway:
   compaction rebinds the compressor and resets the ladder count, so each
   compaction cycle grants the LLM route one stall before escalating; the
   persisted cooldown row still paces attempts across turns and restarts.
+- **Summary provider overloaded → abort, transcript kept.** When the summary
+  call fails with a provider-overload error (`overloaded`, `at capacity`,
+  HTTP 529) and the one-shot main-model retry also fails, compress() aborts
+  and preserves the transcript unchanged instead of committing the
+  deterministic fallback; the warning names the overload
+  (`failure_class=summary_overload_failure`) and `/compress` retries once
+  capacity recovers. Auth/quota, network and empty-content failures already
+  abort the same way.
 - **Provider-proven overflow** — when the provider itself rejects the request
   with a context-length error, the recovery pass ignores the cooldown for one
   bounded attempt (`max_compression_attempts`) without clearing it. Deferring
@@ -224,7 +239,7 @@ compression:
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
   codex_responses_native: false  # gpt-5.6 on direct OpenAI/Codex: server-side compaction (opt-in)
-  codex_responses_compact_threshold: null  # Automatic server compaction trigger
+  codex_responses_compact_threshold: null  # Server compaction trigger; only used when codex_responses_native: true
   in_place: true             # Compact on the same session id, no rotation (default: true)
 
 # Summarization model/provider configured under auxiliary:
@@ -252,7 +267,7 @@ auxiliary:
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
 | `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages only for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription (see below) |
-| `codex_responses_compact_threshold` | `null` | `null` or positive integer | `null` follows the resolved local compression trigger with an 8,192 token safety margin. A positive integer remains absolute and only clamps downward when required. Invalid values use automatic behavior. Automatic mode falls back to `200000` when no usable local trigger exists |
+| `codex_responses_compact_threshold` | `null` | `null` or positive integer | Server-side compaction trigger, read **only when `codex_responses_native: true`** — it never changes when local compression fires; the local trigger is `threshold` (ratio) capped by `threshold_tokens`. `null` follows the resolved local compression trigger with an 8,192 token safety margin. A positive integer remains absolute and only clamps downward when required. Invalid values use automatic behavior. Automatic mode falls back to `200000` when no usable local trigger exists |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
 
 ### In-place compaction (single stable session id)
@@ -424,8 +439,11 @@ the request without it. Switching the session to a non-eligible model or route
 simply stops the field from being sent — captured checkpoints are dropped from
 replay by the existing cross-issuer guard when the endpoint changes.
 
-By default, `compression.codex_responses_compact_threshold: null` derives the
-native threshold from the resolved local trigger. For example, a local trigger
+`compression.codex_responses_compact_threshold` is consulted only while
+`codex_responses_native: true` is in effect; with native compaction off (the
+default) it is ignored and local compression triggers on `threshold` /
+`threshold_tokens` alone. By default, `codex_responses_compact_threshold: null`
+derives the native threshold from the resolved local trigger. For example, a local trigger
 of 765,000 selects 756,808. Set a positive integer to preserve an absolute
 threshold such as 200,000. Invalid values select automatic behavior. If no
 usable local trigger exists, automatic mode uses 200,000. The provider minimum

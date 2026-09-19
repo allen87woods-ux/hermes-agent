@@ -17,14 +17,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import (
-    _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants
+    _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name, tool_call_id_variants, tool_result_id_variants
 )
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
-    STATUS_EXHAUSTED, credential_pool_matches_provider, resolve_runtime_pool_key
+    STATUS_EXHAUSTED, credential_pool_entry_serves_endpoint, credential_pool_matches_provider,
+    resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
@@ -851,6 +852,14 @@ def recover_with_credential_pool(
         next_entry = pool.mark_exhausted_and_rotate(**kwargs)
         if next_entry is None:
             return False
+        if not credential_pool_entry_serves_endpoint(next_entry, getattr(agent, "base_url", None)):
+            # Mixed same-provider pool (#68237): the entry serves another endpoint and _swap_credential
+            # would rebind this session to it. Treat as no recovery, like a rotation that yields nothing.
+            _ra().logger.info(
+                "Credential %s (%s) — pool entry %s serves another endpoint; not swapping",
+                rotate_status, label, getattr(next_entry, "id", "?"),
+            )
+            return False
         _ra().logger.info(
             "Credential %s (%s) — rotated to pool entry %s",
             rotate_status, label, getattr(next_entry, "id", "?"),
@@ -897,6 +906,11 @@ def recover_with_credential_pool(
             pool, has_retried_429=has_retried_429, error_context=error_context,
             api_key_hint=api_key_hint, credential_id=credential_id, rotate_and_swap=_rotate_and_swap,
         )
+    if effective_reason == FailoverReason.model_entitlement:
+        # The pool benches (credential, model) only and hands back the next entry that is not
+        # benched for this model; None once every entry rejected it, so the caller falls
+        # through to the single-credential handling in _mark_entitlement_rejected_model (#71970).
+        return _rotate_and_swap(400, "model entitlement"), has_retried_429
     if effective_reason == FailoverReason.auth:
         return _recover_auth_failure(
             agent, pool, status_code=status_code, has_retried_429=has_retried_429,
@@ -1323,11 +1337,17 @@ def dump_api_request_debug(
     try:
         body = {k: v for k, v in copy.deepcopy(api_kwargs).items() if v is not None and k != "timeout"}
         api_key = None
+        # anthropic_messages keeps its SDK client on ``_anthropic_client`` (``client`` is None):
+        # read the key from there so the dump does not say "Bearer None" (#24293).
+        anthropic = agent.api_mode == "anthropic_messages"
         try:
-            api_key = getattr(agent.client, "api_key", None)
+            live = getattr(agent, "_anthropic_client", None) if anthropic else agent.client
+            api_key = getattr(live, "api_key", None) or getattr(live, "auth_token", None)
         except Exception as e:
             _ra().logger.debug("Could not extract API key for debug dump: %s", e)
-        endpoint = "/responses" if agent.api_mode == "codex_responses" else "/chat/completions"
+        endpoint = {"codex_responses": "/responses", "anthropic_messages": "/messages"}.get(
+            agent.api_mode, "/chat/completions"
+        )
         dump_payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(), "session_id": agent.session_id, "reason": reason,
             "request": {
@@ -1838,6 +1858,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)
+    # Routing proxies name the deployment they served in a response header (#54864).
+    from agent.served_model import install_served_model_capture
+    install_served_model_capture(agent, client)
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 
@@ -2664,34 +2687,44 @@ def _drop_empty_tool_calls_arrays(messages: List[Dict[str, Any]]) -> List[Dict[s
     return normalized
 
 
-def _repair_nameless_tool_calls(messages: List[Dict[str, Any]]) -> None:
-    """Rename empty/missing ``function.name`` to a sentinel (in place): dropping would unpair the
-    anti-priming result the dispatch loop keeps for empty-name calls, and Responses adapters
-    400 on nameless calls."""
-    sentinel = "invalid_tool_call"
+def _repair_invalid_tool_call_names(messages: List[Dict[str, Any]]) -> None:
+    """Coerce every ``function.name`` to the provider-safe ``^[A-Za-z0-9_-]{1,64}$``. An empty/missing
+    name becomes the ``invalid_tool_call`` sentinel (dropping would unpair the anti-priming result the
+    dispatch loop keeps for it); an invalid one (``multi_tool_use.parallel``, a shell command a weak
+    fallback model put in ``name``) is coerced deterministically, because one such stored turn 400s
+    every later request on a strict endpoint and pins the session to the fallback model (#51944).
+    Tool calls are rewritten copy-on-write (an SDK object becomes a dict copy) so a shallow per-call
+    copy never edits persisted history; tool results follow via ``_realign_tool_result_names``."""
     for msg in messages:
         if msg.get("role") != "assistant":
             continue
-        for tc in msg.get("tool_calls") or []:
+        tcs = msg.get("tool_calls") or []
+        for idx, tc in enumerate(tcs):
             if isinstance(tc, dict):
                 fn = tc.get("function")
                 name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
             else:
                 fn = getattr(tc, "function", None)
                 name = getattr(fn, "name", None) if fn else None
-            if isinstance(name, str) and name.strip():
+            coerced = coerce_tool_name(name)
+            if coerced == name:
                 continue
             _ra().logger.warning(
-                "Pre-call sanitizer: repairing tool_call with empty function.name -> %r (id=%s)",
-                sentinel, _ra().AIAgent._get_tool_call_id_static(tc),
+                "Pre-call sanitizer: repairing tool_call with invalid function.name %r -> %r (id=%s)",
+                (name or "")[:80], coerced, _ra().AIAgent._get_tool_call_id_static(tc),
             )
-            if isinstance(fn, dict):
-                fn["name"] = sentinel
-            elif fn is not None and hasattr(fn, "name"):
-                with contextlib.suppress(Exception):
-                    fn.name = sentinel
-            elif isinstance(tc, dict):
-                tc["function"] = {"name": sentinel, "arguments": "{}"}
+            if tcs is msg.get("tool_calls"):
+                tcs = msg["tool_calls"] = list(tcs)
+            if isinstance(tc, dict):
+                fn = {**fn, "name": coerced} if isinstance(fn, dict) else {"name": coerced, "arguments": "{}"}
+                tcs[idx] = {**tc, "function": fn}
+            else:
+                args = getattr(fn, "arguments", None) if fn is not None else None
+                tcs[idx] = {
+                    "id": _ra().AIAgent._get_tool_call_id_static(tc),
+                    "type": "function",
+                    "function": {"name": coerced, "arguments": args if isinstance(args, str) else "{}"},
+                }
 
 
 def _drop_results_without_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2912,7 +2945,7 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     messages = _drop_invalid_roles(messages)
     messages = repair_empty_non_final_messages(messages)
     messages = _drop_empty_tool_calls_arrays(messages)
-    _repair_nameless_tool_calls(messages)
+    _repair_invalid_tool_call_names(messages)
     messages = _drop_results_without_ids(messages)
     messages = _pair_tool_calls_positionally(messages)
     messages = _dedupe_tool_call_ids(messages)

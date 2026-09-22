@@ -7,6 +7,7 @@ Single `memory` tool: add/replace/remove or a batch `operations` list."""
 import copy
 import json
 import logging
+import re
 from contextvars import ContextVar
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -126,6 +127,61 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
     return None
 
 
+_POINTER_QUERY_RE = re.compile(r"holographic:query='([^']+)'")
+
+
+def _lint_pointer_queries(content: Optional[str]) -> Optional[str]:
+    """Write-time lint (09-22, Allen go): a ``holographic:query='...'`` pointer that FTS5
+    cannot parse (dotted/dashed tokens, reserved words like 'slop') or that matches zero
+    facts is guaranteed to be a broken pointer — the same class pointer_check.py catches
+    after the fact (09-17 dash, 09-20 dot, 09-22 reserved word). Reject at write time with
+    the exact term + reason so the caller re-issues with a probe-verified term; a silent
+    write is the unfalsifiable shape. Fail open when the store is absent/unqueryable
+    (no facts_fts table, missing DB) — the daily pointer_check still backstops."""
+    if not content:
+        return None
+    terms = _POINTER_QUERY_RE.findall(content)
+    if not terms:
+        return None
+    db = get_hermes_home() / "memory_store.db"
+    if not db.exists():
+        return None
+    import sqlite3
+    problems: List[str] = []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        for term in dict.fromkeys(terms):
+            try:
+                n = con.execute("SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?", (term,)).fetchone()[0]
+            except sqlite3.OperationalError as e:
+                problems.append(f"'{term}' — unparseable ({e})")
+                continue
+            if n == 0:
+                problems.append(f"'{term}' — 0 facts match")
+    finally:
+        con.close()
+    if not problems:
+        return None
+    return tool_error(
+        "Memory write rejected: new content contains holographic:query pointer(s) that "
+        "cannot resolve: " + "; ".join(problems) +
+        ". FTS5 terms must parse and match at least one stored fact — use plain words "
+        "(no dots, dashes, or FTS5 reserved words) and verify the term returns hits before writing.",
+        success=False)
+
+
+def _batch_op_content(op: Dict[str, Any]) -> str:
+    """Content text of one batch op for pre-gate validation (add/replace content; remove
+    has none to lint)."""
+    act = (op or {}).get("action")
+    if act not in ("add", "replace"):
+        return ""
+    return (op or {}).get("content") or (op or {}).get("new_text") or ""
+
+
 _BG_DELETE_ACTIONS = ("replace", "remove")
 
 
@@ -190,6 +246,13 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
         denied = _background_delete_gate(action, operations, target)
         if denied is not None:
             return denied
+        # Write-time pointer lint BEFORE the gate: a guaranteed-broken
+        # holographic:query pointer must never be staged for approval.
+        if target == "memory":
+            for op in operations:
+                lint_err = _lint_pointer_queries(_batch_op_content(op))
+                if lint_err is not None:
+                    return lint_err
         # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
         gate_result = _apply_write_gate("batch", target, None, None, operations)
         if gate_result is not None:
@@ -198,6 +261,8 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
     if action not in _STORE_ACTIONS:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
     invalid = (_validate_single_op(store, action, target, content, old_text)
+               or (_lint_pointer_queries(content)
+                   if target == "memory" and action in ("add", "replace") else None)
                or _background_delete_gate(action, None, target, content, old_text)
                or _apply_write_gate(action, target, content, old_text))
     if invalid is not None:

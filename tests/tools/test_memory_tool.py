@@ -910,3 +910,74 @@ class TestBackgroundReviewDeleteGate:
             reset_current_write_origin(token)
         assert result["success"] is True
         assert "rewritten by refine" in store._entries_for("memory")
+
+
+# =========================================================================
+# Write-time holographic:query pointer lint (09-22, Allen go)
+# =========================================================================
+
+import sqlite3  # noqa: E402
+
+
+def _make_memory_store_db(home: Path) -> None:
+    """Minimal memory_store.db: facts table + FTS5 index over one fact."""
+    con = sqlite3.connect(home / "memory_store.db")
+    con.execute("CREATE TABLE facts (fact_id INTEGER PRIMARY KEY, content TEXT)")
+    con.execute("CREATE VIRTUAL TABLE facts_fts USING fts5(content)")
+    con.execute("INSERT INTO facts (fact_id, content) VALUES (1, ?)", ("zebra facts about memory pointers",))
+    con.execute("INSERT INTO facts_fts (rowid, content) VALUES (1, ?)", ("zebra facts about memory pointers",))
+    con.commit()
+    con.close()
+
+
+class TestPointerQueryLint:
+    def _set_home(self, tmp_path, monkeypatch, with_store: bool = True):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        if with_store:
+            _make_memory_store_db(tmp_path)
+
+    def test_unparseable_term_rejected(self, store, tmp_path, monkeypatch):
+        self._set_home(tmp_path, monkeypatch)
+        result = json.loads(memory_tool(
+            action="add", content="note → holographic:query='v0.21.3 update'", store=store))
+        assert result["success"] is False
+        assert "unparseable" in result["error"]
+        assert not any(e.startswith("note") for e in store._entries_for("memory"))
+
+    def test_zero_hit_term_rejected(self, store, tmp_path, monkeypatch):
+        self._set_home(tmp_path, monkeypatch)
+        result = json.loads(memory_tool(
+            action="add", content="note → holographic:query='zzz nonexistent qqq'", store=store))
+        assert result["success"] is False
+        assert "0 facts match" in result["error"]
+        assert not any(e.startswith("note") for e in store._entries_for("memory"))
+
+    def test_resolvable_pointer_allowed(self, store, tmp_path, monkeypatch):
+        self._set_home(tmp_path, monkeypatch)
+        result = json.loads(memory_tool(
+            action="add", content="note → holographic:query='zebra facts'", store=store))
+        assert result["success"] is True
+        assert any(e.startswith("note") for e in store._entries_for("memory"))
+
+    def test_batch_with_broken_pointer_rejected_atomically(self, store, tmp_path, monkeypatch):
+        self._set_home(tmp_path, monkeypatch)
+        result = json.loads(memory_tool(
+            operations=[{"action": "add", "content": "ok entry"},
+                        {"action": "add", "content": "bad → holographic:query='v1.2.3'"}],
+            store=store))
+        assert result["success"] is False
+        assert "unparseable" in result["error"]
+        # Atomic: the clean op in the same batch must not land either.
+        assert not any(e.startswith("ok entry") for e in store._entries_for("memory"))
+
+    def test_missing_store_fails_open(self, store, tmp_path, monkeypatch):
+        self._set_home(tmp_path, monkeypatch, with_store=False)
+        result = json.loads(memory_tool(
+            action="add", content="note → holographic:query='anything at all'", store=store))
+        assert result["success"] is True
+
+    def test_user_target_not_linted(self, store, tmp_path, monkeypatch):
+        self._set_home(tmp_path, monkeypatch)
+        result = json.loads(memory_tool(
+            action="add", target="user", content="pref → holographic:query='v0.1 x'", store=store))
+        assert result["success"] is True

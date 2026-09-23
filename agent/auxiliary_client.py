@@ -3128,6 +3128,10 @@ _PAYMENT_KEYWORDS = _BILLING_PATTERNS + (
     "credits", "insufficient funds", "can only afford", "billing",
     "isn't available on the free tier", "key limit exceeded", "budget limit",
     "requires a subscription", "upgrade for access", "upgrade for higher limits",
+    # OpenRouter free-tier delisting (09-23, ling-3.0-flash-vl:free -> 404 "This model is
+    # unavailable for free. The paid version is available now"): without these the 404 reads as
+    # a generic error and the explicit-provider gate dead-ends instead of walking the chain.
+    "unavailable for free", "paid version is available",
     "reached your session usage limit", "quota exceeded", "quota_exceeded",
     "too many tokens per day", "daily limit", "tokens per day", "daily quota", "resource exhausted",
     "resource_exhausted", "resource-exhausted", "resourceexhausted",

@@ -8076,14 +8076,24 @@ async def _async_call_llm_impl(
                     create=_acreate),
                 task, **validate_kw)
         try:
-            return await _primary(provider=request_provider, base_url=req.base_info)
+            result = await _primary(provider=request_provider, base_url=req.base_info)
+            if task == "vision":
+                # Spend visibility: paid vision primary (deepseek) is otherwise
+                # silent on success (09-23). One greppable line per call.
+                logger.info("Auxiliary vision served by %s (%s)",
+                            request_provider, req.final_model)
+            return result
         except Exception as transient_err:
             # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
             if not _should_retry_same_provider(task, transient_err, " (async)"):
                 raise
             logger.info("Auxiliary %s (async): transient transport error; retrying "
                         "once on the same provider before fallback: %s", task or "call", transient_err)
-            return await _primary()
+            result = await _primary()
+            if task == "vision":
+                logger.info("Auxiliary vision served by %s (%s)",
+                            request_provider, req.final_model)
+            return result
     except Exception as first_err:
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)

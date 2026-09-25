@@ -40,6 +40,10 @@ Your request
   → 400 "model is not supported when using Codex with a ChatGPT account"?
       → Bench this key for that model only, rotate to the next key (other models stay usable)
       → Every key rejects the model → fallback_model; the model is skipped for the session
+  → HTTP 200 but `response.status: failed` (ChatGPT/Codex reports usage limits this way)?
+      → Same rules as above, keyed on the embedded error code/message:
+        quota/billing/auth → pool rotation first, provider fallback only once the pool is exhausted;
+        content-policy and other failures → no rotation
   → Success → continue normally
 ```
 
@@ -124,6 +128,7 @@ Each `hermes auth add openai-codex` login becomes its own pool entry, but only *
 | `hermes auth add <provider>` | Add a credential (prompts for type and key) |
 | `hermes auth add <provider> --type api-key --api-key <key>` | Add an API key non-interactively |
 | `hermes auth add <provider> --type oauth` | Add an OAuth credential via browser login |
+| `hermes auth add openai-codex --browser` | Codex only: sign in with the browser authorization-code + PKCE flow on `localhost:1455` instead of the default device code (for orgs that disable device-code grants); falls back to device code when the port is busy. Default for every Codex login via `auth.codex_login_flow: browser` |
 | `hermes auth add <provider> --priority 0` | Add a credential and place it first in the `fill_first` order |
 | `hermes auth priority <provider> <target> <n>` | Move a credential to priority `n` (0 = tried first); the rest are renumbered |
 | `hermes auth remove <provider> <index>` | Remove credential by 1-based index |
@@ -314,7 +319,7 @@ This means subagents benefit from the same rate-limit resilience as the parent, 
 
 The credential pool uses a threading lock for all state mutations (`select()`, `mark_exhausted_and_rotate()`, `try_refresh_current()`, `mark_used()`). This ensures safe concurrent access when the gateway handles multiple chat sessions simultaneously.
 
-Across processes (many subagents, a gateway plus a CLI, cron jobs), OAuth refreshes are serialized through a file lock on `auth.json`. When one shared OAuth grant expires under many concurrent processes, exactly one process performs the refresh; the others detect that the on-disk token no longer matches the one that failed and adopt it instead of rotating the single-use refresh token again. A process that loses the lock race keeps its entry healthy and retries — lock contention is never recorded as a credential failure.
+Across processes (many subagents, a gateway plus a CLI, cron jobs), OAuth refreshes are serialized through a file lock on `auth.json`. When one shared OAuth grant expires under many concurrent processes, exactly one process performs the refresh; the others detect that the on-disk token no longer matches the one that failed and adopt it instead of rotating the single-use refresh token again. A process that loses the lock race keeps its entry healthy and retries — lock contention is never recorded as a credential failure. A session or process still holding an older copy of the pool never writes that copy's tokens back over a pair another one rotated since; it keeps the newer pair on disk and adopts it.
 
 ## Architecture
 

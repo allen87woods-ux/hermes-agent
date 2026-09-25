@@ -5,6 +5,7 @@ AIAgent first: ``run_codex_app_server_turn`` drives one ``codex app-server`` sub
 from __future__ import annotations
 
 import contextvars
+import functools
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from typing import Any, Callable, Dict, List
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from agent.sdk_transform_bypass import bypass_sdk_request_transform
+from agent.stream_diag import buffer_connect_exhausted_notice
 from agent.usage_anchor import set_usage_anchor
 
 logger = logging.getLogger(__name__)
@@ -259,6 +261,20 @@ def _record_codex_app_server_compaction(agent, turn, *, approx_tokens: int | Non
 # Item types that project to a Hermes tool_call (keep in sync with agent/transports/codex_event_projector.py
 # so UI names match recorded names). webSearch is codex's built-in tool: no projector entry, still gets a bubble.
 _CODEX_TOOL_ITEM_TYPES = frozenset({"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"})
+# Text-delta notifications → the agent stream hook each one feeds. Single source for both the display
+# handlers and the liveness set below, so a new delta method can't stream without refreshing activity (#118410).
+_CODEX_TEXT_DELTA_METHODS = (
+    ("item/agentMessage/delta", "_fire_stream_delta"),
+    ("item/reasoning/delta", "_fire_reasoning_delta"),
+    ("item/reasoning/summaryDelta", "_fire_reasoning_delta"),
+    ("item/reasoning/textDelta", "_fire_reasoning_delta"),
+    ("item/reasoning/summaryTextDelta", "_fire_reasoning_delta"),
+)
+# Notifications that prove the turn is alive: every text delta plus tool output streams (no UI handler).
+_CODEX_PROGRESS_DELTA_METHODS = frozenset(m for m, _ in _CODEX_TEXT_DELTA_METHODS) | {
+    "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
+}
+_CODEX_PROGRESS_ITEM_TYPES = _CODEX_TOOL_ITEM_TYPES | {"agentMessage", "reasoning"}
 # Internal MCP server wrapping Hermes' native tools: its inner dispatch has no tool_progress_callback, so the
 # codex-level mcpToolCall IS the display event and the mcp.hermes-tools.* prefix is stripped (users see Hermes tools).
 _STATIC_TOOL_NAMES = {"commandExecution": "exec_command", "fileChange": "apply_patch", "webSearch": "web_search"}
@@ -266,6 +282,12 @@ _STABLE_ID_PREFIXES = {"commandExecution": "exec", "fileChange": "apply_patch"}
 _MCP_LIKE_ITEM_TYPES = {"mcpToolCall", "dynamicToolCall"}
 # Item types whose preview is the first 120 chars of one string field.
 _PREVIEW_FIELDS = {"commandExecution": "command", "webSearch": "query"}
+
+
+def _delta_text(params: dict) -> str:
+    """Non-empty text carried by an app-server delta notification, else ""."""
+    text = params.get("delta") or params.get("text")
+    return text if isinstance(text, str) else ""
 
 
 def _item_changes(item: dict) -> list[dict]:
@@ -352,8 +374,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     Tool items fire ``tool_progress_callback`` plus the stable-ID ``tool_start_callback`` /
     ``tool_complete_callback`` card hooks; deltas go to ``_fire_stream_delta`` / ``_fire_reasoning_delta``;
     a completed agentMessage goes to ``_emit_interim_assistant_message`` (the gateway's ``already_streamed``
-    check dedupes against streamed deltas). Every callback is guarded so a buggy display hook cannot
-    tear down the turn loop."""
+    check dedupes against streamed deltas). Current-turn progress refreshes the activity clock even
+    without display hooks. Every callback is guarded so a buggy display hook cannot tear down the turn loop."""
     # item_id -> (tool_name, args, started_monotonic); duration even when codex omits durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
@@ -388,11 +410,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                  args=(_stable_call_id(item, name), name, args, result))
 
     def _fire_delta(params: dict, attr: str) -> None:
-        text = params.get("delta") or params.get("text") or ""
+        text = _delta_text(params)
         # Single-writer guard (#65991): a superseded stream must not pollute the turn's accumulated text
         # (which also feeds the interim-visible-text de-dup comparison), even when a caller reaches this
         # directly (the tool-suppressed content path) rather than through _fire_stream_delta.
-        if isinstance(text, str) and text:
+        if text:
             agent_cb(attr, f"{attr} raised", args=(text,))
 
     def _fire_agent_message_completed(item: dict) -> None:
@@ -417,17 +439,31 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         elif completed and item_type == "agentMessage":
             _fire_agent_message_completed(item)
     handlers: dict[str, Callable[[dict], None]] = {
-        "item/agentMessage/delta": lambda p: _fire_delta(p, "_fire_stream_delta"),
-        "item/reasoning/delta": lambda p: _fire_delta(p, "_fire_reasoning_delta"),
-        "item/reasoning/summaryDelta": lambda p: _fire_delta(p, "_fire_reasoning_delta"),
-        "item/started": lambda p: _on_item(p, completed=False), "item/completed": lambda p: _on_item(p, completed=True),
+        method: functools.partial(_fire_delta, attr=attr) for method, attr in _CODEX_TEXT_DELTA_METHODS
     }
+    handlers["item/started"] = lambda p: _on_item(p, completed=False)
+    handlers["item/completed"] = lambda p: _on_item(p, completed=True)
 
     def on_event(note: dict) -> None:
-        handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
+        if not isinstance(note, dict):
+            return
+        method = note.get("method") or ""
+        params = note.get("params")
+        params = params if isinstance(params, dict) else {}
+        # The session has already filtered foreign thread/turn notifications. Count
+        # progress even without UI callbacks (or when commentary is hidden), but
+        # never let empty deltas or transport keepalives mask a stalled turn.
+        item = params.get("item")
+        is_delta = method in _CODEX_PROGRESS_DELTA_METHODS and bool(_delta_text(params))
+        is_item = (
+            method in {"item/started", "item/completed"} and isinstance(item, dict)
+            and item.get("type") in _CODEX_PROGRESS_ITEM_TYPES
+        )
+        if is_delta or is_item:
+            agent_cb("_touch_activity", "_touch_activity raised", args=(f"codex app-server: {method}",))
+        handler = handlers.get(method)
         if handler is not None:
-            params = note.get("params")
-            handler(params if isinstance(params, dict) else {})
+            handler(params)
     return on_event
 
 
@@ -451,10 +487,68 @@ def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any]:
     return interrupted, message
 
 
-def _ensure_codex_session(agent) -> None:
-    """Lazily spawn one CodexAppServerSession per AIAgent (reused across turns, closed by the _cleanup hook)."""
-    if getattr(agent, "_codex_session", None) is not None:
+def _codex_developer_instructions(agent) -> str:
+    """The prompt composition the standard loop sends as its system message (turn_context order)."""
+    developer_instructions = getattr(agent, "_cached_system_prompt", None) or ""
+    if getattr(agent, "ephemeral_system_prompt", None):
+        developer_instructions = (developer_instructions + "\n\n" + agent.ephemeral_system_prompt).strip()
+    return developer_instructions
+
+
+# Durable codex thread binding: ``sessions.model_config.codex_thread_id`` (hermes_state), written after the
+# turn's projected rows were committed, read by the next AIAgent built for the same Hermes session so an
+# API-server restart (or the per-request agents of /api/sessions/{id}/chat) resumes the model-side thread
+# instead of starting an empty one while Hermes' own transcript continues (#100531).
+_CODEX_THREAD_ID_KEY = "codex_thread_id"
+_CODEX_THREAD_RESUME_NOTICE = "Codex thread could not be resumed; starting a new one."
+
+
+def _stored_codex_thread_id(agent) -> str | None:
+    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+    if db is None or not session_id:
+        return None
+    thread_id = db.get_session_model_config_value(session_id, _CODEX_THREAD_ID_KEY)
+    return thread_id if isinstance(thread_id, str) and thread_id else None
+
+
+def _store_codex_thread_id(agent, thread_id: str | None) -> None:
+    """Merge (``None`` clears) the binding into the session row; a failed write only logs — the turn is done."""
+    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+    if db is None or not session_id:
         return
+    _call_guarded(db.patch_session_model_config, "codex thread id could not be stored on the session row",
+                  args=(session_id, {_CODEX_THREAD_ID_KEY: thread_id}))
+
+
+def _start_codex_thread(agent) -> str:
+    """``ensure_started`` with the fail-closed resume policy: a stored thread that codex cannot hand back
+    (unknown id, rollout locked by a killed app-server, different thread) is dropped from the session row,
+    the user is told once on the status rail, and a fresh thread starts on the same client."""
+    from agent.transports.codex_app_server_session import CodexThreadResumeError
+    try:
+        return agent._codex_session.ensure_started()
+    except CodexThreadResumeError as exc:
+        logger.warning("%s; starting a new codex thread (session=%s)", exc.message, getattr(agent, "session_id", None))
+        _store_codex_thread_id(agent, None)
+        agent._emit_diagnostic_status(_CODEX_THREAD_RESUME_NOTICE)
+        return agent._codex_session.ensure_started()
+
+
+def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -> None:
+    """Lazily spawn one CodexAppServerSession per AIAgent (reused across turns, closed by the _cleanup hook).
+    A live session whose thread was started with a different prompt composition (TUI/Desktop ``/personality``
+    or a prompt mirror mutate the agent in place) is retired first so the new thread carries the current one.
+    Only the FIRST session of an AIAgent resumes the stored codex thread: a retired/recreated one keeps
+    today's fresh-thread behaviour and overwrites the binding once its turn is committed. ``messages`` is the
+    turn's transcript (current user row last); a thread started from scratch is seeded with the prior turns."""
+    developer_instructions = _codex_developer_instructions(agent)
+    if getattr(agent, "_codex_session", None) is not None:
+        # Only a session whose recorded composition differs is stale; one attached without a record is kept.
+        recorded = getattr(agent, "_codex_session_prompt", None)
+        if recorded is None or recorded == developer_instructions:
+            return
+        _close_codex_session(agent)
+    resume_thread_id = None if getattr(agent, "_codex_session_prompt", None) is not None else _stored_codex_thread_id(agent)
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
     from hermes_cli.codex_runtime_switch import get_configured_codex_binary
@@ -477,22 +571,42 @@ def _ensure_codex_session(agent) -> None:
     # _emit_interim_assistant_message). Without this, Discord/Telegram users see no live tool-progress or
     # interim commentary while codex_app_server is running — only the final answer (#33200). Supersedes the
     # narrower item/started-only bridge from #38835.
+    # Hermes owns the prompt: the same composition the standard loop sends as its system message
+    # (cached per-session prompt + ephemeral additions such as channel overrides) rides along ONCE per
+    # thread as developerInstructions. A retired/recreated session re-sends the current composition.
+    # A thread started from scratch (no resumable codex thread) also receives the session's prior turns
+    # once, so a /model switch into codex or a retired thread does not start blind (#74712, #26035).
+    # The recorded composition stays the bare prompt: the seed must not make the next turn retire the thread.
+    agent._codex_session_prompt = developer_instructions
+    from agent.codex_runtime_history_seed import render_history_seed
+    history_seed = render_history_seed(messages) or None
+    # A named custom provider (``providers.<name>``) maps onto codex's own ``[model_providers.<name>]``
+    # table: send the stable id plus the active model and let codex resolve base_url/env_key itself, so
+    # Hermes' credential never enters the JSON-RPC payload (#75186). openai/openai-codex keep codex's defaults.
+    model_provider = None
+    if str(getattr(agent, "provider", "") or "").strip().lower() == "custom":
+        from hermes_cli.runtime_provider_custom import codex_model_provider_id
+        model_provider = codex_model_provider_id(str(getattr(agent, "requested_provider", "") or ""))
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
         codex_bin=get_configured_codex_binary(load_config()),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
+        developer_instructions=developer_instructions or None,
+        model=getattr(agent, "model", None) if model_provider else None, model_provider=model_provider,
+        resume_thread_id=resume_thread_id, history_seed=history_seed,
     )
 
 
-def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> None:
-    """Splice the projected messages into ``messages`` and flush them to the session DB.
+def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> bool:
+    """Splice the projected messages into ``messages`` and flush them to the session DB; True when the
+    rows are durable in the session DB (the codex thread binding may then be published).
 
     Bypasses conversation_loop's per-step _persist_session(); the flush dedups via _DB_PERSISTED_MARKER so
     only the new codex rows are written. The agent stays the sole persister (agent_persisted=True): a
     gateway re-write would re-INSERT the user turn."""
     if not turn.projected_messages:
-        return
+        return False
     from agent.message_metadata import append_message
     projected_messages = turn.projected_messages
     # Turn-start persistence owns the accepted input. Codex's leading user item
@@ -505,7 +619,7 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
     for projected_message in projected_messages:
         append_message(messages, projected_message)
     if getattr(agent, "_session_db", None) is None:
-        return
+        return False
     flush_ok = False
     try:
         flush_ok = agent._flush_messages_to_session_db(messages)
@@ -515,6 +629,7 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
         # Output already streamed and agent_persisted cannot flip to False: surface the gap loudly.
         logger.warning("codex app-server turn was delivered but could NOT be persisted to the session DB "
                        "(session=%s) — this turn will be missing after restart/resume", getattr(agent, "session_id", None))
+    return flush_ok is True
 
 
 def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_user_message: Any,
@@ -552,8 +667,9 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         from agent.conversation_compression import _checkpoint_blocked
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
-    _ensure_codex_session(agent)
+    _ensure_codex_session(agent, messages)
     try:
+        _start_codex_thread(agent)
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
@@ -568,7 +684,10 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     if getattr(turn, "should_retire", False):
         logger.warning("codex app-server session retired (turn error: %s)", turn.error)
         _close_codex_session(agent)
-    _persist_projected_messages(agent, turn, messages)
+    # The binding is published only once the transcript it belongs to is durable, and never for a
+    # retired thread (the next agent would only resume into the same wedge).
+    if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
+        _store_codex_thread_id(agent, turn.thread_id)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
@@ -934,19 +1053,37 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if watchdog_state is not None
         else getattr(agent, "_active_codex_stream_request_token", None)
     )
-    # Delta-sink claim for the CURRENT physical attempt (None until the stream opens).
-    writer_token = {"value": None}
+    # Delta-sink claim for the CURRENT physical attempt (None until the stream opens). A newer attempt that
+    # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
+    # because stopping here handed the gateway a "completed" response missing its tail (#69486).
+    writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
+
+    def _writer_is_current() -> bool:
+        token = writer_token["value"]
+        if token is None or stream_writer_is_current(agent, token):
+            return True
+        if not writer_token["superseded_logged"]:
+            writer_token["superseded_logged"] = True
+            logger.warning("Codex streaming attempt superseded by a newer stream; suppressing its live deltas while "
+                           "consuming to completion so the final response is not truncated (model=%s).",
+                           api_kwargs.get("model", "unknown"))
+        return False
 
     def _fenced(fn: Callable[[Any], None]) -> Callable[[Any], None]:
         """Wrap a callback so a retired request's late frames never reach the agent."""
         return lambda value: fn(value) if _request_is_current() else None
 
+    def _live(fn: Callable[..., None]) -> Callable[..., None]:
+        """Wrap a live-display callback so a superseded writer's frames never reach the sink (retired ones neither)."""
+        return lambda *args: fn(*args) if _request_is_current() and _writer_is_current() else None
+
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
-        agent._fire_stream_delta(text)
+        if _writer_is_current():
+            agent._fire_stream_delta(text)
 
     def _on_event(event: Any) -> None:  # TTFB/activity touch — once per SSE event.
         now = time.time()
@@ -956,14 +1093,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if getattr(agent, "_last_api_first_chunk_at", None) is None:
             agent._last_api_first_chunk_at = now
         has_progress = _codex_event_has_content(event)
+        first_event = first_progress = False
         if watchdog_state is not None:
             with watchdog_state.lock:
-                if watchdog_state.retry_started_ts is not None:
-                    watchdog_state.retry_started_ts = None
-                    watchdog_state.last_progress_ts = None
+                first_event = watchdog_state.last_event_ts is None
                 watchdog_state.last_event_ts = now
                 if has_progress:
+                    first_progress = watchdog_state.last_progress_ts is None
                     watchdog_state.last_progress_ts = now
+                    if watchdog_state.phase_aware:
+                        watchdog_state.retry_started_ts = None
+        if first_event:
+            logger.info("Codex stream first parsed event at %.3f (attempt=%s/%s, model=%s)",
+                now, attempt + 1, max_stream_retries + 1, model)
+        if first_progress:
+            logger.info("Codex stream first substantive progress at %.3f (attempt=%s/%s, model=%s)",
+                now, attempt + 1, max_stream_retries + 1, model)
         agent._touch_activity("receiving stream response")
 
     def _interrupt_or_superseded() -> bool:
@@ -990,21 +1135,21 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
         logger.warning("Codex Responses request failed: serialized_request_body_bytes=%s stream_opened=%s "
-                       "exception_chain=%s model=%s", "unknown" if request_body_bytes is None else request_body_bytes,
-                       str(writer_token["value"] is not None).lower(), exception_chain, getattr(agent, "model", "unknown"))
+                       "exception_chain=%s model=%s attempt=%s", "unknown" if request_body_bytes is None else request_body_bytes,
+                       str(writer_token["value"] is not None).lower(), exception_chain, getattr(agent, "model", "unknown"),
+                       f"{attempt + 1}/{max_stream_retries + 1}")
+        if writer_token["value"] is None:
+            # No stream ever opened: the user gets one line naming host/attempts/size (#97548).
+            buffer_connect_exhausted_notice(
+                agent, exc, attempts=attempt + 1,
+                base_url=getattr(active_client, "base_url", None) or getattr(agent, "base_url", ""))
 
     def _codex_stream_created(_raw_stream: Any) -> None:
         # Claim the delta sink for THIS attempt; a newer attempt supersedes this token.
         writer_token["value"] = claim_stream_writer(agent)
         writer_token["raw_stream"] = _raw_stream
-
-    def _accept_codex_chunk(_chunk: Any) -> bool:
-        token = writer_token["value"]
-        if token is None or stream_writer_is_current(agent, token):
-            return True
-        logger.warning("Codex streaming attempt superseded by a newer stream; stopping consumption to preserve "
-                       "the single-writer invariant (model=%s).", api_kwargs.get("model", "unknown"))
-        return False
+        logger.debug("Codex stream opened (attempt=%s/%s, model=%s)",
+            attempt + 1, max_stream_retries + 1, model)
 
     def _drain_for_finalizer(event_stream: Any) -> None:
         # ``final`` is already assembled; draining only lets Relay run its finalizer. A transport error
@@ -1057,7 +1202,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 agent._abort_request_openai_client(active_client, reason="codex_stream_close_failed")
     show_commentary = getattr(agent, "show_commentary", True)
     wants_commentary = getattr(agent, "interim_assistant_callback", None) is not None and show_commentary
-    on_commentary_message = _fenced(lambda text: agent._fire_streamed_codex_commentary(text)) if wants_commentary else None
+    on_commentary_message = _live(agent._fire_streamed_codex_commentary) if wants_commentary else None
     call_role = ("delegated" if getattr(agent, "is_subagent", False)
                  else "fallback" if int(getattr(agent, "_fallback_index", 0) or 0) > 0 else "primary")
     for attempt in range(max_stream_retries + 1):
@@ -1066,12 +1211,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
         if attempt > 0 and watchdog_state is not None and watchdog_state.phase_aware:
-            # A physical reconnect has its own no-event TTFB phase. Its first parsed
-            # event clears this marker and starts a fresh model-progress phase.
+            # One origin for the whole physical attempt: lifecycle frames may change
+            # diagnostics, but cannot restart the first-progress budget.
             with watchdog_state.lock:
                 watchdog_state.retry_started_ts = time.time()
+                watchdog_state.last_event_ts = None
+                watchdog_state.last_progress_ts = None
+                logger.info("Codex physical stream retry at %.3f (attempt=%s/%s, model=%s)",
+                    watchdog_state.retry_started_ts, attempt + 1, max_stream_retries + 1, model)
         intercepted_events: list = []
         writer_token["value"] = writer_token["raw_stream"] = event_stream = None
+        writer_token["superseded_logged"] = False
         try:
             try:
                 event_stream = relay_llm.stream(
@@ -1080,7 +1230,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     name=str(getattr(agent, "provider", "") or "codex"), model_name=str(model or ""),
                     finalizer=lambda: _consume_codex_event_stream(list(intercepted_events), model=model),
                     on_stream_created=_codex_stream_created, on_chunk=intercepted_events.append,
-                    chunk_adapter=lambda chunk: chunk, accept_chunk=_accept_codex_chunk,
+                    chunk_adapter=lambda chunk: chunk,
                     completed_response_predicate=lambda r: bool(hasattr(r, "output") and not hasattr(r, "__iter__")),
                     metadata={"api_mode": "codex_responses", "call_role": call_role, "retry_count": attempt,
                               "api_request_id": getattr(agent, "_current_api_request_id", None)},
@@ -1088,8 +1238,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 final = _consume_codex_event_stream(
                     event_stream, model=model, on_text_delta=_fenced(_on_text_delta),
-                    on_reasoning_delta=_fenced(lambda text: agent._fire_reasoning_delta(text)),
-                    on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
+                    on_reasoning_delta=_live(agent._fire_reasoning_delta), on_commentary_message=on_commentary_message,
+                    on_first_delta=_live(on_first_delta) if on_first_delta is not None else None,
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
@@ -1110,6 +1260,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     return event_stream.final_response
                 raise
             except _APIConnectionError as exc:
+                # The SDK wraps every connect/receive failure (``raise APIConnectionError from err``), so the
+                # raw ``transport_errors`` branch above never sees a pre-stream failure. Before the stream
+                # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
+                # token is claimed the inference may already be billed, so mid-stream failures still raise.
+                if (attempt < max_stream_retries and writer_token["value"] is None
+                        and isinstance(exc.__cause__, _httpx.TransportError)):
+                    logger.debug(
+                        "Codex Responses pre-stream connect failed (attempt %s/%s); retrying. %s error=%s",
+                        attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,
+                    )
+                    continue
                 _log_failure(exc)
                 raise
             if not agent._interrupt_requested:

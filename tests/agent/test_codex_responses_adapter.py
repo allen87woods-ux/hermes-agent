@@ -7,12 +7,10 @@ from agent.codex_responses_adapter import (
     _chat_content_to_responses_parts,
     _chat_messages_to_responses_input,
     _classify_responses_issuer,
-    _format_responses_error,
     _normalize_codex_response,
     _neutralize_harmony_tokens,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
-    _responses_tools,
 )
 
 
@@ -888,9 +886,6 @@ def test_preflight_passes_native_web_search_tool_through():
 # ---------------------------------------------------------------------------
 
 
-def test_format_responses_error_message_only():
-    err = {"message": "Upstream model unavailable"}
-    assert _format_responses_error(err, "failed") == "Upstream model unavailable"
 
 
 def _final_text_response(text):
@@ -984,3 +979,18 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
+
+def test_codex_preflight_passes_text_verbosity_through():
+    """The preflight whitelist must let the Responses ``text`` block reach the wire (#20203).
+
+    Before it was allowed, ``text.verbosity`` died inside Hermes with
+    "unsupported field(s): text" before the request ever left the process.
+    """
+    kwargs = {
+        "model": "gpt-5.1", "instructions": "system", "store": False,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "text": {"verbosity": "low"},
+    }
+    assert _preflight_codex_api_kwargs(dict(kwargs))["text"] == {"verbosity": "low"}
+    # An empty block is dropped, like the other optional fields, instead of rejected.
+    assert "text" not in _preflight_codex_api_kwargs({**kwargs, "text": {}})

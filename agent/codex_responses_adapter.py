@@ -165,7 +165,11 @@ def _neutralize_harmony_tokens(text: str) -> str:
     """Keep Harmony source readable without emitting reserved wire tokens."""
     if not text or "<" not in text or "|" not in text:
         return text
-    if not any(unicodedata.category(char) == "Cf" for char in text):
+    # No ASCII code point is a Unicode format control (Cf): str.isascii() is an O(1) flag
+    # check, and other text only needs each distinct non-ASCII character categorised once.
+    if text.isascii() or not any(
+        unicodedata.category(char) == "Cf" for char in set(text) if char > "\x7f"
+    ):
         return _HARMONY_CONTROL_TOKEN_RE.sub(rf"<{_FULLWIDTH_PIPE}\1{_FULLWIDTH_PIPE}>", text)
     # The backend strips Unicode format controls (e.g. U+200B) before its reserved-token
     # check, so match on the visible text and rewrite the original spans.
@@ -903,6 +907,8 @@ _PREFLIGHT_OPTIONAL_FIELDS: tuple[tuple[str, Callable[[Any], bool], Optional[Cal
     ("reasoning", lambda v: isinstance(v, dict), None),
     ("include", lambda v: isinstance(v, list), None),
     ("service_tier", _nonblank, str.strip),
+    # Responses text controls (verbosity, structured-output format).
+    ("text", lambda v: isinstance(v, dict) and bool(v), None),
     ("max_output_tokens", lambda v: isinstance(v, (int, float)) and v > 0, int),
     ("timeout", lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < float("inf"), float),
     ("temperature", lambda v: isinstance(v, (int, float)), float),

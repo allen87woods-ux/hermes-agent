@@ -3,15 +3,17 @@ import {
   BranchPickerPrimitive,
   ErrorPrimitive,
   MessagePrimitive,
+  useAui,
   useAuiState,
   useMessageRuntime,
   useThreadRuntime
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type FC, type ReactNode, useCallback, useContext, useMemo, useState } from 'react'
+import { type FC, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { useInRouterContext, useNavigate } from 'react-router'
 
 import { requestModelMenuToggle } from '@/app/chat/composer/focus'
+import { useComposerScope } from '@/app/chat/composer/scope'
 import { useSessionView } from '@/app/chat/session-view'
 import { SETTINGS_ROUTE } from '@/app/routes'
 import { dispatchedTo } from '@/components/assistant-ui/thread/agent-delivery'
@@ -35,7 +37,16 @@ import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
-import { errorRecoveryPlan, type ErrorSurface, formatErrorDiagnostics, isOAuthReauthSurface } from '@/lib/error-surface'
+import {
+  errorRecoveryPlan,
+  type ErrorSurface,
+  formatCountdown,
+  formatErrorDiagnostics,
+  formatLimitReset,
+  formatResetClock,
+  isOAuthReauthSurface,
+  scheduledRetryDelayMs
+} from '@/lib/error-surface'
 import { errorCardText } from '@/lib/error-surface-copy'
 import { triggerHaptic } from '@/lib/haptics'
 import {
@@ -416,7 +427,7 @@ const AssistantPreviewEmbeds: FC = () => {
   return (
     <div className="mt-3 flex flex-wrap gap-2">
       {previewTargets.map(target => (
-        <PreviewAttachment key={target} source="explicit-link" target={target} />
+        <PreviewAttachment key={target} target={target} />
       ))}
     </div>
   )
@@ -668,6 +679,87 @@ const CompressConversationAction: FC<{ label: string }> = ({ label }) => {
   )
 }
 
+// One client-side retry of THIS turn at the provider's own reset moment (#98852,
+// option B): arm → visible countdown + Cancel → fires `message().reload()` — the
+// exact call behind the Retry button — exactly once. Nothing persists: closing
+// the app, switching sessions or unmounting the card drops the timer, and a
+// retry that 429s again just shows the card (and this button) again.
+const ScheduledRetryAction: FC<{ resetsAt: number }> = ({ resetsAt }) => {
+  const { t } = useI18n()
+  const copy = t.assistant.thread
+  const aui = useAui()
+
+  // Armed once the user clicks; `fireAt` is the wall-clock ms the timer targets.
+  const [fireAt, setFireAt] = useState<null | number>(null)
+  const [now, setNow] = useState(() => Date.now())
+
+  // A manual Retry, a new message, or a later turn all make firing wrong: the
+  // reload would regenerate a message that is no longer the tail. Same gate
+  // `useActionBarReload` applies to the Retry button itself.
+  const stale = useAuiState(s => s.thread.isRunning || s.thread.isDisabled || !s.message.isLast)
+
+  useEffect(() => {
+    if (fireAt === null || stale) {
+      return
+    }
+
+    const timer = window.setTimeout(
+      () => {
+        setFireAt(null)
+        aui.message().reload()
+      },
+      Math.max(0, fireAt - Date.now())
+    )
+
+    const tick = window.setInterval(() => setNow(Date.now()), 1000)
+
+    return () => {
+      window.clearTimeout(timer)
+      window.clearInterval(tick)
+    }
+  }, [aui, fireAt, stale])
+
+  useEffect(() => {
+    if (stale) {
+      setFireAt(null)
+    }
+  }, [stale])
+
+  const delay = scheduledRetryDelayMs(resetsAt, now)
+
+  if (fireAt !== null) {
+    return (
+      <span className="inline-flex items-center gap-1.5" data-testid="error-retry-scheduled">
+        <span className="px-1 text-xs text-muted-foreground">
+          {copy.errorRetryScheduled(formatResetClock(resetsAt), formatCountdown(fireAt - now))}
+        </span>
+        <button className="aui-error-action" onClick={() => setFireAt(null)} type="button">
+          {copy.errorRetryScheduledCancel}
+        </button>
+      </span>
+    )
+  }
+
+  if (delay === null || stale) {
+    return null
+  }
+
+  return (
+    <button
+      className="aui-error-action"
+      onClick={() => {
+        triggerHaptic('submit')
+        setNow(Date.now())
+        setFireAt(resetsAt * 1000)
+      }}
+      type="button"
+    >
+      <RefreshCwIcon className="size-3" />
+      {copy.errorRetryAtReset(formatResetClock(resetsAt))}
+    </button>
+  )
+}
+
 const ErrorRecoveryActions: FC = () => {
   const { t } = useI18n()
   const copy = t.assistant.thread
@@ -768,6 +860,9 @@ const ErrorRecoveryActions: FC = () => {
   }, [])
 
   const localFolders = Boolean(window.hermesDesktop?.logsRoot)
+  // The provider's own reset moment (429 Retry-After / resets_at), so the user knows WHEN
+  // Retry will work instead of guessing (#98852). Informational only: no automatic retry.
+  const limitReset = formatLimitReset(surface?.resetsAt)
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -815,6 +910,12 @@ const ErrorRecoveryActions: FC = () => {
           </button>
         </ActionBarPrimitive.Reload>
       )}
+      {plan.retry && limitReset && (
+        <span className="px-1 text-xs text-muted-foreground" data-testid="error-limit-reset">
+          {copy.errorLimitResets(limitReset)}
+        </span>
+      )}
+      {plan.retry && surface?.resetsAt !== undefined && <ScheduledRetryAction resetsAt={surface.resetsAt} />}
       {plan.switchProvider && inRouter && <SwitchProviderAction label={copy.errorSwitchProvider} />}
       {localFolders && (
         <button className="aui-error-action" onClick={() => void openLogs()} type="button">
@@ -944,6 +1045,8 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
   const voicePlayback = useStore($voicePlayback)
   const view = useSessionView()
   const sessionId = useStore(view.$runtimeId)
+  // A Bot chat's session owns its own (connection, profile) → its own TTS voice.
+  const { connectionId, profile } = useComposerScope()
 
   const readAloudStatus =
     voicePlayback.source === 'read-aloud' && voicePlayback.messageId === messageId ? voicePlayback.status : 'idle'
@@ -962,12 +1065,12 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
     }
 
     try {
-      await playSpeechText(text, { messageId, source: 'read-aloud' })
+      await playSpeechText(text, { connectionId, messageId, profile, source: 'read-aloud' })
       markAssistantIdSpoken(sessionId, view.$messages.get(), messageId)
     } catch (error) {
       notifyError(error, copy.readAloudFailed)
     }
-  }, [copy.readAloudFailed, getText, messageId, sessionId, view.$messages])
+  }, [connectionId, copy.readAloudFailed, getText, messageId, profile, sessionId, view.$messages])
 
   return (
     <TooltipIconButton

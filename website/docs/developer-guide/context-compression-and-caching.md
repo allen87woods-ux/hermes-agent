@@ -238,7 +238,7 @@ compression:
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
-  codex_responses_native: false  # gpt-5.6 on direct OpenAI/Codex: server-side compaction (opt-in)
+  codex_responses_native: false  # Opt-in server compaction: gpt-5.6 on OpenAI/Codex; Astra on Codex OAuth
   codex_responses_compact_threshold: null  # Server compaction trigger; only used when codex_responses_native: true
   in_place: true             # Compact on the same session id, no rotation (default: true)
 
@@ -266,7 +266,7 @@ auxiliary:
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.4/5.5/5.6 and gpt-6 Astra on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
-| `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages only for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription (see below) |
+| `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription, and exact `gpt-6-astra` on official Codex OAuth (see below) |
 | `codex_responses_compact_threshold` | `null` | `null` or positive integer | Server-side compaction trigger, read **only when `codex_responses_native: true`** — it never changes when local compression fires; the local trigger is `threshold` (ratio) capped by `threshold_tokens`. `null` follows the resolved local compression trigger with an 8,192 token safety margin. A positive integer remains absolute and only clamps downward when required. Invalid values use automatic behavior. Automatic mode falls back to `200000` when no usable local trigger exists |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
 
@@ -285,7 +285,9 @@ Set `in_place: false` to restore the legacy rotating path, where each compaction
 
 A smaller auxiliary compression model can lower the live compression trigger without
 changing the selected tail policy. In `lean` mode the selection budget remains based
-on the **main model's context window**: 2.5%, clamped to 10K–25K tokens. For example,
+on the **main model's context window**: 2.5%, clamped to 10K–25K tokens, and never more
+than 20% of that window (the 10K floor alone is 61% of a 16K local window, so without the cap a
+small model's "protected" tail was the whole request and compaction reclaimed nothing). For example,
 a 1M main model (`threshold_tokens: null`) with a 512K auxiliary model retains a 25K
 selection budget even when feasibility lowers its trigger from 850K to 512K. Explicit `legacy` mode instead
 recomputes `threshold_tokens × target_ratio` (102,400 tokens at 512K × 0.20).
@@ -369,19 +371,22 @@ hermes config set compression.codex_gpt55_autoraise_notice false
 
 ### Codex large-context `-900k` picker variants (opt-in)
 
-The ChatGPT Codex backend *advertises* a 272K window for the gpt-5.4 and
-gpt-5.6 (Sol/Terra/Luna) families, but actually accepts ~911K input tokens
+The ChatGPT Codex backend *advertises* a 272K window for the gpt-5.4, gpt-5.6
+(Sol/Terra/Luna) and GPT-6 (Sol/Terra/Luna) families, but actually accepts ~911K input tokens
 for ChatGPT-subscription accounts (live-verified Aug 2026). Hermes keeps the
 **advertised 272K as the default** for the base slugs — a bigger window means
 more tokens per request and much faster subscription-usage burn, so the large
 window is strictly opt-in.
 
 To use the large window, pick the explicit `-900k` variant in `/model` (e.g.
-`gpt-5.6-sol-900k`, `gpt-5.6-terra-900k`, `gpt-5.6-luna-900k`,
-`gpt-5.4-900k`). These are Hermes-side aliases: the suffix is stripped before
+`gpt-6-sol-900k`, `gpt-6-terra-900k`, `gpt-6-luna-900k`, `gpt-5.6-sol-900k`,
+`gpt-5.6-terra-900k`, `gpt-5.6-luna-900k`, `gpt-5.4-900k`). These are Hermes-side aliases: the suffix is stripped before
 the model id is sent to the backend, and pricing/usage accounting treats them
 as the base model. Slugs that genuinely enforce 272K (gpt-5.5, gpt-5.4-mini)
-have no `-900k` variant.
+have no `-900k` variant. When the authenticated Codex catalog publishes a
+`max_context_window` below 900K for the base slug (e.g. 872K), the `-900k`
+variant resolves to that live maximum instead; 900K remains the offline
+fallback and a published maximum above 900K does not raise it.
 
 Compaction thresholds follow the window: base slugs (272K) get the **85%
 autoraise** described above, while `-900k` variants keep your global
@@ -410,7 +415,7 @@ Hermes' local transcript is never rewritten on this runtime — state.db records
 the compaction boundary while the visible transcript stays intact. All other
 routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
-### Native Responses compaction (gpt-5.6 on direct OpenAI / Codex subscription)
+### Native Responses compaction (gpt-5.6 and Astra on supported routes)
 
 OpenAI's Responses API supports server-side compaction: when a request includes
 `context_management: [{type: "compaction", compact_threshold: N}]` and the
@@ -424,12 +429,18 @@ client-side summary pass, and ZDR-friendly (`store: false`, no
 Opt in with `compression.codex_responses_native: true`. The gate is deliberately
 narrow, re-checked on every request:
 
-- **Models:** the gpt-5.6 family only. Other models fail server-side when the
-  field is present (gpt-5.1/5.2 return HTTP 500 or stall the stream — there is
-  no structured rejection to downgrade on, verified live Aug 2026).
+- **Models:** the gpt-5.6 family, plus exact `gpt-6-astra` on official Codex
+  subscription OAuth. Astra on the direct API, Astra variants and other GPT-6
+  models are excluded. gpt-5.1/5.2 return HTTP 500 or stall the stream when the
+  field is present (no structured rejection to downgrade on, verified live Aug 2026).
 - **Routes:** `api.openai.com` (OpenAI API key) or the ChatGPT Codex backend
   (Codex subscription OAuth) only. xAI, GitHub/Copilot, OpenRouter, relays, and
   local servers never see the field.
+
+For Astra, both the resolved `openai-codex` provider and an official HTTPS
+`chatgpt.com/backend-api/codex` endpoint are required. A trusted proxy override
+does not enable Astra compaction. This uses the existing automatic
+`context_management` path and does not add `configuration_update` history.
 
 Everything else about compression is unchanged: the local compressor stays
 armed as the fallback owner (the native threshold is clamped ~8K tokens below
@@ -499,8 +510,11 @@ outputs (file contents, terminal output, search results).
 ```
 
 Tail protection is **token-budget based**: walks backward from the end,
-accumulating tokens until the budget is exhausted. Falls back to the fixed
-`protect_last_n` count if the budget would protect fewer messages.
+accumulating tokens until the budget is exhausted. The budget — and the 1.5× soft
+ceiling whole rows may overrun it by — is capped at 20% of the context window on every
+model, so `protect_last_n` is a *minimum* only up to a small count floor (8 rows) and never
+forces a tail that cannot leave room to compact; only the required last-user / last-assistant
+anchors and atomic tool groups may exceed the cap.
 
 Boundaries are aligned to avoid splitting tool_call/tool_result groups.
 The `_align_boundary_backward()` method walks past consecutive tool results
@@ -701,10 +715,12 @@ Prompt caching is automatically enabled when:
 - The provider supports `cache_control` (native Anthropic API or OpenRouter)
 
 ```yaml
-# config.yaml — TTL is configurable (must be "5m" or "1h")
+# config.yaml — TTL is configurable: "5m", "1h", or "auto"
 prompt_caching:
   cache_ttl: "5m"
 ```
+
+`"auto"` resolves once per session in `agent/agent_init.py::_init_prompt_cache_config` via `agent/prompt_caching.py::auto_cache_ttl_for_source`: `1h` for human-paced sources, `5m` for `MACHINE_PACED_SOURCES` (subagent, cron, oneshot, webhook, kanban, api, tool, batch). Auxiliary/stub calls (`configured_cache_ttl()`) treat `auto` as `5m`.
 
 The CLI shows caching status at startup:
 ```

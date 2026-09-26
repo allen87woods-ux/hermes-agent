@@ -492,6 +492,10 @@ export const frOverrides = {
     backendOutOfDateTitle: 'Backend obsolète',
     backendOutOfDateMessage:
       'Votre backend Hermes est plus ancien que cette version du desktop et peut ne pas fonctionner correctement. Mettez-le à jour pour les aligner.',
+    desktopOutOfDateTitle: 'Application Hermes obsolète',
+    desktopOutOfDateMessage:
+      "Cette application Hermes est plus ancienne que le backend auquel elle est connectée et peut ne pas fonctionner correctement. Effectuez la mise à jour de l'application pour les aligner.",
+    updateDesktopApp: "Mettre à jour l'application",
     installMethodUnsupportedTitle: "Méthode d'installation non prise en charge",
     updateHermes: 'Mettre à jour Hermes',
     updateReadyTitle: 'Mise à jour prête',
@@ -4456,7 +4460,7 @@ export const frOverrides = {
       copyFailure: 'Impossible de copier le critère dans le presse-papiers',
       continuationFailed: "Impossible de soumettre la poursuite de l'objectif",
       continuationQueued: 'Objectif repris — poursuite en attente de la fin du tour actuel',
-      continuationBusy: 'Objectif repris — session occupée, utilisez /interrupt pour poursuivre',
+      continuationBusy: "Objectif repris — session occupée, arrêtez d'abord la réponse en cours (bouton Stop ou Échap) pour poursuivre",
       controlUnavailable: msg => `Commandes de session indisponibles : ${msg}`,
       dismissError: "Masquer l'erreur",
       add: 'Ajouter'
@@ -4804,6 +4808,7 @@ export const frOverrides = {
     replaceCurrent: 'Remplacer la valeur actuelle',
     pasteApiKey: 'Collez votre clé API',
     localApiKeyPlaceholder: 'Clé API (facultatif — uniquement si votre point de terminaison en requiert une)',
+    localModelNamePlaceholder: 'Nom du modèle (ex. command-a-plus-05-2026)',
     couldNotSave: "Impossible d'enregistrer l'identifiant.",
     connecting: 'Connexion',
     update: 'Mettre à jour',
@@ -4957,6 +4962,7 @@ export const frOverrides = {
       search: 'Rechercher des modèles',
       noModels: 'Aucun modèle trouvé',
       editModels: 'Modifier les modèles…',
+      followDefault: 'Utiliser le modèle par défaut des Réglages',
       refreshModels: 'Actualiser les modèles',
       fast: 'Rapide'
     },

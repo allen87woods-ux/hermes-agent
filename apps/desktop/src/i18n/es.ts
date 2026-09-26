@@ -492,6 +492,10 @@ export const esOverrides = {
     backendOutOfDateTitle: 'Backend desactualizado',
     backendOutOfDateMessage:
       'Tu backend de Hermes es más antiguo que esta compilación de escritorio y puede no funcionar correctamente. Actualízalo para alinearlos.',
+    desktopOutOfDateTitle: 'Aplicación de Hermes desactualizada',
+    desktopOutOfDateMessage:
+      'Esta aplicación de Hermes es más antigua que el backend al que está conectada y puede no funcionar correctamente. Actualiza la aplicación para alinearlos.',
+    updateDesktopApp: 'Actualizar aplicación',
     installMethodUnsupportedTitle: 'Método de instalación no compatible',
     updateHermes: 'Actualizar Hermes',
     updateReadyTitle: 'Actualización lista',
@@ -4435,7 +4439,7 @@ export const esOverrides = {
       copyFailure: 'No se pudo copiar el criterio al portapapeles',
       continuationFailed: 'No se pudo enviar la continuación del objetivo',
       continuationQueued: 'Objetivo reanudado: la continuación queda en cola hasta que termine el turno actual',
-      continuationBusy: 'Objetivo reanudado: la sesión está ocupada; usa /interrupt en el turno actual para continuar',
+      continuationBusy: 'Objetivo reanudado: la sesión está ocupada; detén primero la respuesta actual (botón Stop o Esc) para continuar',
       controlUnavailable: (msg: string) => `Controles de sesión no disponibles: ${msg}`,
       dismissError: 'Descartar error',
       add: 'Añadir'
@@ -4783,6 +4787,7 @@ export const esOverrides = {
     replaceCurrent: 'Reemplazar valor actual',
     pasteApiKey: 'Pegar clave API',
     localApiKeyPlaceholder: 'Clave API (opcional; solo si tu endpoint la requiere)',
+    localModelNamePlaceholder: 'Nombre del modelo (p. ej. command-a-plus-05-2026)',
     couldNotSave: 'No se pudo guardar la credencial.',
     connecting: 'Conectando',
     update: 'Actualizar',
@@ -4937,6 +4942,7 @@ export const esOverrides = {
       search: 'Buscar modelos',
       noModels: 'No se encontraron modelos',
       editModels: 'Editar modelos…',
+      followDefault: 'Usar el predeterminado de Ajustes',
       refreshModels: 'Actualizar modelos',
       fast: 'Rápido'
     },

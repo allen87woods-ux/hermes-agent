@@ -33,7 +33,7 @@ Two invariants shape almost every design decision and are the lens for reviewing
 The project's intent layer. It serves humans aiming a contribution AND the automated triage
 sweeper, which may only close on `implemented_on_main`, `cannot_reproduce`, or `incoherent`.
 Taste-based "out of scope" closes are a human maintainer's call; the sweeper's job is to
-recognize design intent and *avoid wrongly closing a legitimate contribution*.
+recognize design intent and avoid wrongly closing a legitimate contribution.
 
 Read the balance right: Hermes ships a **lot**. Most merges are bug fixes to reported
 behavior, and the product surface (platforms, providers, models, desktop/TUI features)
@@ -51,8 +51,7 @@ grow: expansive at the edges, conservative at the waist.
   the existing setup/config UX (`hermes tools`, `hermes setup`, auto-install) rather than
   bolting on a raw env var.
 - **Refactor god-files into clean modules.** Huge mechanical `+N/-N` extraction PRs are
-  wanted work. "Every line traces to the request" applies to *feature* PRs; a declared
-  refactor's request IS the extraction.
+  wanted work; a declared refactor's request IS the extraction.
 - **Keep the core narrow.** Prefer, in order: extend existing code → CLI command + skill →
   service-gated tool (`check_fn`) → plugin → MCP server in the catalog → new core tool (last
   resort). See the Footprint Ladder.
@@ -69,8 +68,6 @@ grow: expansive at the edges, conservative at the waist.
 - **Cache-, alternation-, and invariant-safe.** Preserve prompt caching, strict role
   alternation (never two same-role messages in a row; never a synthetic user message injected
   mid-loop), and a system prompt byte-stable for the life of a conversation.
-- **Contributor credit preserved.** Salvage external work by cherry-picking (rebase-merge) so
-  authorship survives; build on top rather than reimplementing.
 
 ### What we don't want (rejected even when well-built)
 
@@ -90,7 +87,7 @@ grow: expansive at the edges, conservative at the waist.
   (`git log -p -S`) before restricting behavior; find a fix that preserves the feature.
 - **Outbound telemetry / usage attribution without opt-in gating.** No analytics,
   third-party identifier tagging, or attribution tags until a generic user-facing opt-in
-  (config gate + setup prompt + `hermes tools` toggle) exists. Park behind a label.
+  (config gate + setup prompt + `hermes tools` toggle) exists.
 - **Change-detector tests, cache-breaking mid-conversation, dead code wired in without E2E
   proof, plugins that touch core files.** Plugins work within the ABCs/hooks we provide; if
   one needs more, widen the generic plugin surface, never special-case it in core.
@@ -121,9 +118,6 @@ the sweeper when a PR is NOT safe to close (when in doubt, leave it open for a h
 - **"The absence was deliberate."** Restoring "missing" `__init__.py` files made a test tree
   importable as a dotted package that shadowed the real plugin and deleted its `register()`
   at import time. The omission was load-bearing.
-- **"Overreached / resurrected an approach we moved past."** Scope creep beyond the agreed
-  base, or reviving a direction maintainers closed, is rejected even when it works. Offer the
-  rest as a focused follow-up.
 
 Throughline: **verify the claim AND the intent against the codebase before writing or merging
 a fix.** A reproduction on current `main` plus a line-level account beats a plausible
@@ -167,9 +161,6 @@ is "inside the Hermes desktop app". The pattern:
 - **`check_fn` answers reachability or opt-in, not surface.** "Is the bridge wired?" — fine.
   "Was I spawned by Electron?" — not. `check_fn` results are TTL-cached process-wide
   (`tools/registry.py`); a per-session answer does not belong there.
-- **Ask which identity you mean.** `HERMES_DESKTOP=1` legitimately means "this backend was
-  spawned by the app" (cron ticker, web-dist handling). It does NOT mean "a GUI is watching";
-  the embedded terminal pane (`hermes --tui` against that backend) is the counterexample.
 
 Test: if the capability still makes sense with the client on another machine, it is
 session-scoped. Assert the GUI session gets the tool **with the env var absent**.
@@ -179,13 +170,10 @@ session-scoped. Assert the GUI session gets the tool **with the env var absent**
 ```bash
 source ./activate   # provisions/syncs PM tools + dependencies, then activates
 ```
-Select an isolated development `HERMES_HOME` and `HERMES_RUNTIME_DIR` first;
-see `website/docs/reference/package-management.md#developer-workflow`.
-PowerShell: `. .\activate.ps1`. `deactivate` restores the prior environment.
-For tests, use the independent test environment in `CONTRIBUTING.md` (or Nix);
-PM activation's `PYTHONPATH` does not survive the test runner's environment scrub.
-`scripts/run_tests.sh` probes `.venv`, then `venv`, then `$HOME/.hermes/hermes-agent/venv`
-(worktrees sharing the main checkout's venv).
+Select an isolated development `HERMES_HOME` and `HERMES_RUNTIME_DIR` first (see
+`website/docs/reference/package-management.md#developer-workflow`); `deactivate` restores the
+prior environment. For tests, use the independent test environment in `CONTRIBUTING.md` — PM
+activation's `PYTHONPATH` does not survive the test runner's environment scrub.
 
 ## Project Structure
 
@@ -301,57 +289,21 @@ families: `hermes_state.py` (21), `gateway/run.py` (15), `tools/mcp_tool.py` (15
   hand-written known-path table outside `hermes_platform/` fails
   `tests/test_managed_runtime_resolution.py` unless allowlisted with a reason; resolvers land in
   `hermes_platform/resolver/`. Lookup never installs, downloads, or starts anything.
-- **Argparse alias dispatch:** `add_parser("list", aliases=["ls"])` sets `dest` to the literal
-  the user typed (`"ls"`). Dispatch must accept both (caught PTY-testing `hermes webhook ls`).
 - **Don't wire in dead code without E2E validation.** Unshipped code was dead for a reason;
   E2E the real resolution chain with real imports against a temp `HERMES_HOME` first.
 
-### TypeScript style (desktop, TUI, website, future TS packages)
-
-Small nanostores over component state when state is shared or read by distant UI; each
-feature owns its atoms (chat near chat, shared in `src/store`); rendering components use
-`useStore`, non-rendering actions read `$atom.get()`; never thread state through three
-components when the leaf can subscribe; persistence sits beside the atom that owns it. Route
-roots stay thin (compose routes + shell, never controllers). No monolithic hooks — one narrow
-job each; colocated action modules over god hooks. Pure side-effect callbacks use the terse
-void form `onState={st => void setGatewayState(st)}`; async handlers make intent explicit
-`onClick={() => void save()}`. Interfaces for public props and shared object shapes (not
-`type X = {...}`); extend React primitives (`React.ComponentProps<'button'>`, `Omit`, `Pick`).
-Table-driven beats condition ladders for ids/routes/views. `src/app` owns routes/pages,
-`src/store` shared atoms, `src/lib` pure helpers.
-
 ## Dependency Pinning Policy
-
-All dependencies carry upper bounds (litellm compromise #2796/#2810; Mini Shai-Hulud worm,
-May 2026). PyPI: `>=floor,<next_major` (`"httpx>=0.28.1,<1"`); pre-1.0: `<0.(minor+2)`
-(`>=0.29,<0.32`). Git URLs: 40-char commit SHA. GitHub Actions: SHA + `# vN` comment. CI-only
-Python requirements: `==exact`. A bare `>=X.Y.Z` is rejected by CI and reviewers.
-After changing `pyproject.toml`, run `hermes pm lock`, re-source `./activate`, and commit
-`pyproject.toml` with `uv.lock`. Reference: #2810 (bounds), #9801 (SHA pinning + audit CI).
 
 PM owns Hermes Python dependency changes. Use `pm.sync_venv(['extra'], explicit=True)`
 for declared runtime extras, `hermes pm install` for setup/sync, and `hermes pm repair`
 for damaged dependencies. Do not mutate Hermes environments with raw pip or uv.
-Use `pm.build_environment` for fresh build outputs and `pm.ensure_environment` for
-isolated tool environments. Callers receive an interpreter or tool path, not uv.
-Nix's declarative uv2nix builds and unrelated user projects remain independently owned.
-
-The `[tool.uv] exclude-newer = "14 days"` quarantine covers **Hermes's own dependencies only**
-(every registry package in core's `uv.lock`). Plugin `python_dependencies` follow the plugin's own
-policy: when PM generates the plugin workspace (`pm/workspace.py::_core_release_quarantine`) the
-global cutoff moves onto each core-locked package, so plugin-only packages are not filtered and a
-plugin still cannot drag a core package past the window. Teknium's ruling: "plugins dont have to
-abide by our 14 day rule … Only hermes' dependencies themselves have to." We recommend (not require)
-plugin authors adopt their own quarantine — the developer guide and `plugin-catalog/README.md` carry
-that guidance.
+`[tool.uv] exclude-newer = "14 days"` quarantines Hermes's own `uv.lock` packages; a
+plugin's `python_dependencies` follow the plugin's own policy. After changing
+`pyproject.toml`, run `hermes pm lock`, re-source `./activate`, and commit `pyproject.toml`
+with `uv.lock`.
 
 ## Commits, Merges, PRs
 
-- **Squash merges from stale branches silently revert recent fixes.** Before squash-merging,
-  bring the branch to `main` (`git fetch origin main && git reset --hard origin/main`, re-apply
-  the PR's commits). Verify with `git diff HEAD~1..HEAD` after merging — unexpected deletions
-  are a red flag.
-- Salvage by cherry-pick so contributor authorship survives (see rubric).
 - Tests per fix: 1–2 INVARIANT tests (behaviour contract, proven red on base), never
   change-detectors; ≤ 2 tests is the salvage bar too. Reject/rewrite in salvaged diffs:
   appendages to facades, new god helpers, compat aliases, wrappers.
@@ -387,15 +339,13 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
   retried (relaunching a runaway doubles the damage). Pass-on-retry is green but printed under `⚠ FLAKY`
   with both outputs — a bug to fix, not noise. Timing tests must not assume a quiet runner:
   wall-clock bounds ≥ 2s, event-based sync, no `assert not _wait_until(...)` races.
-- **Placement mirrors the source tree.** A test lives in `tests/<top-level source dir>/` (`tests/hermes_cli/`,
-  `tests/agent/`, `tests/hermes_state/`, `tests/gateway/relay/`, ...); installer/updater script tests
-  under `tests/scripts/{install,desktop_update}/`. Only tests of root-level modules (`batch_runner`,
-  `utils`, `hermes_constants`, packaging) sit directly in `tests/`. No issue numbers in filenames —
-  cite the issue in the module docstring (`test_89315_x.py` → `test_x.py`, "Regression for #89315").
-- **Placement (CI lanes):** `scripts/ci/classify_changes.py` picks jobs by changed files. A Python test
-  asserting about `package.json`, `package-lock.json`, `tsconfig.json`, or `.ts/.tsx/.js/
-  .mjs/.cjs` sources will not run on a JS-only PR (green on PR, red on `main` where the
-  classifier fails open). Such tests belong in the vitest suite, not `tests/*.py`.
+- **Placement mirrors the source tree.** A test lives in `tests/<top-level source dir>/`
+  (`tests/hermes_cli/`, `tests/agent/`, `tests/hermes_state/`, `tests/gateway/relay/`, ...);
+  installer/updater script tests under `tests/scripts/{install,desktop_update}/`. Only tests
+  of root-level modules (`batch_runner`, `utils`, `hermes_constants`, packaging) sit directly
+  in `tests/`. No issue numbers in filenames — cite the issue in the module docstring
+  (`test_89315_x.py` → `test_x.py`, "Regression for #89315"). JS/TS source tests belong in
+  the vitest suite, not `tests/*.py` (the CI change classifier won't run them on a JS-only PR).
 - **Tests must not write to `~/.hermes/`.** The autouse `_isolate_hermes_home` fixture in
   `tests/conftest.py` redirects `HERMES_HOME`; never hardcode `~/.hermes/` in tests. Profile
   tests also mock `Path.home()` so `_get_profiles_root()` / `_get_default_hermes_home()` stay
@@ -440,22 +390,6 @@ on arm64), `platforms("posix")` (Linux or macOS).
 Specs: `linux`, `macos`, `windows`, `posix`, `any`, and `not <spec>`.
 The historic `linux_only` / `macos_only` / `windows_only` markers have been
 fully replaced — `platforms` is the only host-gating marker in the tree.
-
-**Live Windows process-topology E2E: the `wine2e` lane.** For claims about
-real Windows process behavior that mocks cannot reproduce (venv-holder
-scans, process-tree parentage, launcher/worker chains, detach semantics),
-there is an on-demand workflow `windows-venv-e2e.yml` that runs
-`tests/hermes_cli/test_venv_holder_windows_live.py` on a real
-`windows-latest` runner — spawning actual processes and driving the real
-detection code, no mocked psutil. It fires ONLY on pushes to `wine2e/**`
-branches (inert on PRs and main; costs nothing on normal work). The proven
-workflow: write probes that pin CORRECT behavior, push to a `wine2e/`
-branch to reproduce the bugs live on unfixed code, build the fix, iterate
-until the lane is green, then open the PR — the live receipt on the exact
-head is the Windows proof reviewers ask for. Extend the live suite when
-touching that subsystem; assert against the gateway ANCESTOR found by
-argv, not the direct parent (the venv shim makes every spawn a
-launcher/worker chain).
 
 **Use the marker, never a bare `skipif`.** `scripts/ci/list_os_marked_tests.py`
 decides which files an OS lane imports by resolving the quoted specs inside

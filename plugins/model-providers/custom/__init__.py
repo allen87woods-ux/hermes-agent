@@ -7,7 +7,22 @@ from urllib.parse import urlparse
 from agent.reasoning_effort import OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort
 from providers import register_provider
 from providers.base import ProviderProfile
-from utils import base_url_host_matches
+from utils import base_url_host_matches, base_url_hostname
+
+#: Local inference-server endpoints (llama.cpp et al.): a GGUF chat template may
+#: validate reasoning_effort and 500 on levels its vocabulary lacks. Hermes'
+#: local Qwen3.8 template (2026-09-26, live-verified from the server error text)
+#: accepts exactly xhigh (default) / medium / low, so max/ultra requests clamp to
+#: xhigh here instead of reaching the wire and turning a config error into a paid
+#: cloud fallback via fallback_providers. Other custom relays (vLLM, SGLang,
+#: GLM-on-ARK, ...) keep the full OpenAI-compat vocabulary.
+_LOCAL_LLAMA_EFFORTS: tuple[str, ...] = ("medium", "low", "xhigh")
+_LOCAL_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+
+def _looks_like_local_llama(base_url: str | None) -> bool:
+    """True for loopback inference servers (llama.cpp et al.), not remote relays."""
+    return base_url_hostname(str(base_url or "")) in _LOCAL_HOSTS
 
 
 def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
@@ -80,7 +95,12 @@ class CustomProfile(ProviderProfile):
                 # "none" / "default"; any graded level ("medium", "high") 400s (#75089).
                 top_level["reasoning_effort"] = "default"
             elif effort:
-                top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
+                # Loopback inference servers (llama.cpp et al.): clamp to the local
+                # template's vocabulary so max/ultra never 500 the server (2026-09-26).
+                if _looks_like_local_llama(ctx.get("base_url")):
+                    top_level["reasoning_effort"] = clamp_effort(effort, _LOCAL_LLAMA_EFFORTS)
+                else:
+                    top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
         return extra_body, top_level
 
     def fetch_models(

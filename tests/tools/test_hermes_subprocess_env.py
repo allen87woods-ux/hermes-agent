@@ -123,6 +123,11 @@ class TestTierInvariants:
     def test_tier1_covers_infra_secrets(self):
         assert {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY"} <= _ALWAYS_STRIP_KEYS
 
+    def test_tier1_covers_webui_auth_secrets(self):
+        """The web-UI login password and passkey are the agent's own service credentials:
+        no terminal child needs them, and both are live login material."""
+        assert {"HERMES_WEBUI_PASSWORD", "HERMES_WEBUI_PASSKEY"} <= _ALWAYS_STRIP_KEYS
+
 
 class TestBrowserPassthroughPattern:
     def test_browser_keys_recoverable_after_strip(self):

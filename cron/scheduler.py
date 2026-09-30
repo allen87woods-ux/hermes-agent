@@ -2419,6 +2419,9 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         max_iterations=setup.max_iterations,
+        # Per-job physical output cap (e.g. {"max_tokens": 6000}) — guards against runaway
+        # single-generation output on long-running jobs. Absent/None = provider default.
+        max_tokens=job.get("max_tokens"),
         reasoning_config=setup.reasoning_config,
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,

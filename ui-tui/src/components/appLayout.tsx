@@ -12,8 +12,9 @@ import { $petBox } from '../app/petFlashStore.js'
 import { $uiState } from '../app/uiStore.js'
 import { usePet } from '../app/usePet.js'
 import { INLINE_MODE, NATIVE_MODE, SHOW_FPS, TERMUX_TUI_MODE } from '../config/env.js'
-import { PLACEHOLDER } from '../content/placeholders.js'
+import { placeholder } from '../content/placeholders.js'
 import { prevRenderedMsg } from '../domain/blockLayout.js'
+import { useT } from '../i18n/useT.js'
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
@@ -191,54 +192,52 @@ const TranscriptPane = memo(function TranscriptPane({
     <Box flexDirection="column" paddingX={1}>
       {transcript.virtualHistory.topSpacer > 0 ? <Box height={transcript.virtualHistory.topSpacer} /> : null}
 
-      {transcript.virtualRows
-        .slice(transcript.virtualHistory.start, transcript.virtualHistory.end)
-        .map(row => (
-          <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
-            {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
-              <Box marginTop={1}>
-                <Text color={ui.theme.color.border}>───</Text>
+      {transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end).map(row => (
+        <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
+          {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
+            <Box marginTop={1}>
+              <Text color={ui.theme.color.border}>───</Text>
+            </Box>
+          )}
+
+          {row.msg.kind === 'intro' ? (
+            nativeMode ? null : (
+              <Box flexDirection="column" paddingTop={1}>
+                <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
+
+                {row.msg.info && (
+                  <SessionPanel
+                    info={row.msg.info}
+                    maxWidth={Math.max(1, composer.cols - 2)}
+                    sid={ui.sid}
+                    t={ui.theme}
+                  />
+                )}
               </Box>
-            )}
+            )
+          ) : row.msg.kind === 'panel' && row.msg.panelData ? (
+            <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
+          ) : (
+            <MessageLine
+              cols={bodyCols}
+              compact={ui.compact}
+              detailsMode={ui.detailsMode}
+              detailsModeCommandOverride={ui.detailsModeCommandOverride}
+              msg={row.msg}
+              prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
+                commandOverride: ui.detailsModeCommandOverride,
+                detailsMode: ui.detailsMode,
+                sections: ui.sections
+              })}
+              sections={ui.sections}
+              t={ui.theme}
+              timestamps={ui.timestamps}
+            />
+          )}
 
-            {row.msg.kind === 'intro' ? (
-              nativeMode ? null : (
-                <Box flexDirection="column" paddingTop={1}>
-                  <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
-
-                  {row.msg.info && (
-                    <SessionPanel
-                      info={row.msg.info}
-                      maxWidth={Math.max(1, composer.cols - 2)}
-                      sid={ui.sid}
-                      t={ui.theme}
-                    />
-                  )}
-                </Box>
-              )
-            ) : row.msg.kind === 'panel' && row.msg.panelData ? (
-              <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
-            ) : (
-              <MessageLine
-                cols={bodyCols}
-                compact={ui.compact}
-                detailsMode={ui.detailsMode}
-                detailsModeCommandOverride={ui.detailsModeCommandOverride}
-                msg={row.msg}
-                prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
-                  commandOverride: ui.detailsModeCommandOverride,
-                  detailsMode: ui.detailsMode,
-                  sections: ui.sections
-                })}
-                sections={ui.sections}
-                t={ui.theme}
-                timestamps={ui.timestamps}
-              />
-            )}
-
-            {row.index === lastUserIdx && <LiveTodoPanel />}
-          </Box>
-        ))}
+          {row.index === lastUserIdx && <LiveTodoPanel />}
+        </Box>
+      ))}
 
       {transcript.virtualHistory.bottomSpacer > 0 ? <Box height={transcript.virtualHistory.bottomSpacer} /> : null}
 
@@ -305,6 +304,7 @@ const ComposerPane = memo(function ComposerPane({
   nativeMode: boolean
 }) {
   const ui = useStore($uiState)
+  const T = useT()
   const isBlocked = useStore($isBlocked)
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
 
@@ -462,7 +462,7 @@ const ComposerPane = memo(function ComposerPane({
                   onChange={composer.updateInput}
                   onPaste={composer.handleTextPaste}
                   onSubmit={composer.submit}
-                  placeholder={composer.empty ? PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''}
+                  placeholder={composer.empty ? placeholder() : ui.busy ? T.composer.interruptHint : ''}
                   // Exactly the "(and N more toolsets…)" tone. `muted` is a
                   // MID-luminance family tone, so it reads receded on both
                   // poles even when polarity detection is wrong (transparent
@@ -542,7 +542,7 @@ const StatusRulePane = memo(function StatusRulePane({
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
         model={ui.info?.model ?? ''}
-        modelFast={ui.info?.fast || ui.info?.service_tier === 'priority'}
+        modelFast={ui.info?.fast}
         modelReasoningEffort={ui.info?.reasoning_effort}
         modelReasoningEffortWire={ui.info?.reasoning_effort_wire}
         notice={ui.notice}
@@ -616,10 +616,12 @@ export const AppLayout = memo(function AppLayout({
               <PromptZone
                 cols={composer.cols}
                 onApprovalChoice={actions.answerApproval}
-                onClarifyAnswer={actions.answerClarify}
+                onClarifyCancel={actions.cancelClarify}
                 onClarifyQuestionAnswer={actions.answerClarifyQuestion}
                 onSecretSubmit={actions.answerSecret}
                 onSudoSubmit={actions.answerSudo}
+                onVaultCodeSubmit={actions.answerVaultCode}
+                onVaultSaveLoginSubmit={actions.answerVaultSaveLogin}
                 onVaultUnlockSubmit={actions.answerVaultUnlock}
               />
             </PerfPane>

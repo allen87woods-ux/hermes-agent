@@ -432,13 +432,15 @@ describe('checkBackendUpdates', () => {
       behind: -1,
       update_available: true,
       can_apply: false,
-      update_command: 'managed outside dashboard',
+      update_command: '',
       message: 'Update available.'
     })
 
     const result = await checkBackendUpdates()
 
-    expect(result?.behind).toBe(0)
+    // behind: -1 is the producer's "update available, count unknown" sentinel;
+    // DesktopUpdateStatus carries it as null, never a literal number.
+    expect(result?.behind).toBeNull()
     expect(result?.updateAvailable).toBe(true)
     expect(result?.targetSha).toBe('backend:0.16.0')
   })
@@ -562,6 +564,34 @@ describe('requestActiveUpdate', () => {
 
     requestActiveUpdate()
     await vi.waitFor(() => expect(updateHermesSpy).toHaveBeenCalled())
+  })
+
+  it('shows the refusal message, not a fake command, when the backend has no command to run', async () => {
+    setRemote(true)
+    updateHermesSpy.mockResolvedValue({
+      ok: false,
+      name: 'hermes-update',
+      error: 'dashboard_update_managed_externally',
+      message: 'Hermes updates are managed outside this dashboard in containerized environments.',
+      update_command: ''
+    })
+
+    const result = await applyBackendUpdate()
+
+    expect(result.manual).toBe(true)
+    expect(result.command).toBeUndefined()
+    expect($backendUpdateApply.get().stage).toBe('manual')
+    expect($backendUpdateApply.get().command).toBeNull()
+    expect($backendUpdateApply.get().message).toContain('managed outside this dashboard')
+  })
+
+  it('falls back to `hermes update` only when an older backend omits update_command', async () => {
+    setRemote(true)
+    updateHermesSpy.mockResolvedValue({ ok: false, name: 'hermes-update', message: 'Run it yourself.' })
+
+    await applyBackendUpdate()
+
+    expect($backendUpdateApply.get().command).toBe('hermes update')
   })
 })
 

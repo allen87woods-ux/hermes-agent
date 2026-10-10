@@ -606,6 +606,26 @@ def _submit_row_target_key(session: dict) -> str:
 _SUBMIT_ROW_SESSION_KEY = "_submit_row_session_id"
 
 
+def _session_row_present(db, session_id: str) -> bool | None:
+    """Whether ``session_id`` already owns a row in this store. ``None`` = the store cannot answer.
+
+    ``messages.session_id`` is FK-constrained to ``sessions(id)``, but a session only gets its row on
+    the first flush/submit (``_ensure_session_db_row``), so an OFF-turn write can precede it: a model
+    switch issued between ``session.create`` and the first prompt died with "FOREIGN KEY constraint
+    failed" and lost its durable pivot with just a warning (2026-10-09). Three states on purpose —
+    only an authoritative ``False`` may be acted on, so a store with no reader (or a raising one)
+    never mints a row or redirects a write by mistake.
+    """
+    getter = getattr(db, "get_session", None)
+    if not session_id or getter is None:
+        return None
+    try:
+        return getter(session_id) is not None
+    except Exception:
+        logger.debug("session row probe failed for %s", session_id, exc_info=True)
+        return None
+
+
 def _submit_row_owner_key(staged: dict, session: dict) -> str:
     """The session id a staged submit row lives under: recorded at write time, else the current best.
     Every caller narrows to a dict (and checks ``_row_id``) immediately before, so the recorded value is

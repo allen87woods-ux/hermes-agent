@@ -1846,6 +1846,22 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
                 # live agent writes to, or a model switch between turns on a rotated session files the notice
                 # under a parent the conversation no longer reads from (#123545).
                 target = _submit_row_target_key(session)
+                # …and the live row may not exist yet. A session only gets its `sessions` row on the
+                # first flush/submit (`_ensure_session_db_row`), while this is an OFF-turn write, so a
+                # switch issued between session.create and the first prompt hit
+                # `messages.session_id REFERENCES sessions(id)` with "FOREIGN KEY constraint failed"
+                # and the pivot was lost with just a warning (2026-10-09: switched 8 s after create).
+                # Ensure the row first — the same idempotent upsert prompt.submit uses, so it carries
+                # source/model_config/cwd/profile and the agent's lazy create later keeps it. A rotated
+                # id whose row the publish path has not written has no transcript to hold the pivot,
+                # so file it under session_key (whose row the ensure call just guaranteed).
+                row_present = _session_row_present(db, target)
+                if row_present is not True:
+                    _ensure_session_db_row(session)
+                if row_present is False and target != session_key:
+                    logger.info(
+                        "model switch marker: live session %s has no row yet; filed under %s", target, session_key)
+                    target = session_key
                 # The in-memory strip above keeps one marker; the durable rows need the same invariant or N
                 # switches leave N active rows that all replay on resume (#65891 kept it in memory only).
                 db.deactivate_messages_by_display_kind(target, "model_switch")

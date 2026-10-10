@@ -359,3 +359,30 @@ def test_busy_queue_accept_row_lands_with_the_turn_and_is_addressed_there(monkey
     finally:
         server._sessions.pop(sid, None)
         db.close()
+
+
+def test_model_switch_marker_survives_a_switch_before_the_first_row(monkeypatch, tmp_path):
+    """A switch issued between ``session.create`` and the first prompt has no row to attach to.
+
+    ``messages.session_id`` is FK-constrained to ``sessions(id)``, and the row is only written on the
+    first flush/submit (``_ensure_session_db_row``), so this OFF-turn write died with "FOREIGN KEY
+    constraint failed" and lost its durable pivot with just a warning — observed 2026-10-09: the model
+    was switched 8 s after ``session.create``, before the first prompt. The writer now ensures the row
+    (the same idempotent upsert ``prompt.submit`` uses, so source/model_config/cwd/profile survive),
+    and falls back to ``session_key`` only when a rotated id authoritatively has no row of its own.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        agent = _flush_agent(db, key)  # built, but nothing flushed yet: no row for `key`
+        session["agent"] = agent
+        assert db.get_session(key) is None, "fixture must start with no session row"
+        server._append_model_switch_marker(session, model="test-model", provider="test-provider")
+        prefix = server._MODEL_SWITCH_MARKER_PREFIX
+        assert db.get_session(key) is not None, "the pivot write must leave a resumable session row"
+        live = [r for r in db.get_messages(key) if prefix in str(r.get("content") or "")]
+        assert len(live) == 1, f"durable pivot missing for a pre-first-prompt switch: {_rows(db, key)}"
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()

@@ -104,10 +104,17 @@ class TestLongLivedPromotion:
         assert plan.promoted_from_long_lived_foreground is True
         assert plan.promoted_from_foreground_timeout is None
 
-    def test_ampersand_and_nohup_plans_still_raise(self):
-        for cmd in ("sleep 5 &", "nohup make test"):
-            with pytest.raises(_Rejected):
-                _plan_execution(cmd, task_id=None, timeout=None, background=False, _host_local=True)
+    def test_trailing_amp_converts_while_nohup_still_raises(self):
+        """Post-merge policy (2026-10-23): a lone TRAILING `&` is auto-converted into a tracked
+        background session (upstream's trailing_amp_background_command), so it no longer raises.
+        nohup/disown/setsid still need the command itself rewritten and stay refusals (local)."""
+        plan = _plan_execution(
+            "sleep 5 &", task_id=None, timeout=None, background=False, _host_local=True,
+        )
+        assert plan.auto_background_command == "sleep 5"
+        assert plan.promoted_from_long_lived_foreground is False
+        with pytest.raises(_Rejected):
+            _plan_execution("nohup make test", task_id=None, timeout=None, background=False, _host_local=True)
 
     def test_explicit_background_flag_is_untouched(self):
         """A caller that already asked for background must not be double-promoted."""

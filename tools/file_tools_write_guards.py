@@ -600,10 +600,13 @@ def _stale_write_refusal(filepath: str, reason: str, resolved: str | None = None
     result = {
         "error": (
             f"Refusing to overwrite {filepath}: {reason} "
-            "The file was NOT modified. Reload the current contents with read_file "
-            "(every page, for a file that needs offset/limit), merge the requested "
-            "change, then call write_file again. For small edits, prefer patch so "
-            "existing unrelated changes are preserved."),
+            "The file was NOT modified. Next action — pick one: "
+            "(1) targeted edit -> call `patch` with the exact text to replace (cheapest path, "
+            "no prior full read needed); "
+            "(2) full rewrite -> call read_file (every page, for a file that needs offset/limit), "
+            "then call write_file again. Do not retry the identical write_file call."),
+        "next_action": ("patch for a targeted edit; read_file (all pages) then write_file "
+                        "for a full rewrite; never resend the same write_file unchanged"),
         "stale_write_blocked": True,
         "path": filepath,
     }

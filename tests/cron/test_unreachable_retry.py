@@ -195,3 +195,45 @@ def test_ladder_reruns_do_not_spend_extra_repeat_budget(tmp_cron_home, monkeypat
     assert held == [True, True, True, False]
     # But a rung whose limit was edited down to the count does retire the job: send its notice.
     assert not ur.will_retry(dict(runs[1], repeat={"times": 1, "completed": 1}))
+
+
+# --- Connection-error classification + first-failure silence (2026-10-30) -----------------
+# A provider that drops the connection reaches the scheduler as a bare
+# RuntimeError("Connection error."): run_agent's result carries only the error STRING, so no
+# exception type survives to match on. The zero-API-call gate is what keeps a mid-run tool
+# failure from being mislabelled as "never reached the model".
+
+
+class _ZeroCallAgent:
+    session_api_calls = 0
+
+
+class _BusyAgent:
+    session_api_calls = 9
+
+
+def test_connection_error_message_is_transient_when_no_call_was_made():
+    assert ur.is_model_unreachable_failure(RuntimeError("Connection error."), _ZeroCallAgent())
+
+
+def test_connection_error_after_a_model_call_is_not_unreachable():
+    assert not ur.is_model_unreachable_failure(RuntimeError("Connection error."), _BusyAgent())
+
+
+def test_transient_streak_holds_the_first_failure_and_alerts_the_second(tmp_cron_home):
+    """One silent re-run per outage: the first unreachable failure holds its notice, a second
+    consecutive one alerts, and any run that reaches the model clears the streak."""
+    job: dict = {}
+    assert ur.hold_first_transient(job) is True, "no recorded streak == first failure, hold it"
+
+    job[ur.STREAK_KEY] = ur.note_transient_failure("job-connerr")
+    assert job[ur.STREAK_KEY] == 1
+    assert ur.hold_first_transient(job) is True
+
+    job[ur.STREAK_KEY] = ur.note_transient_failure("job-connerr")
+    assert job[ur.STREAK_KEY] == 2
+    assert ur.hold_first_transient(job) is False, "a repeat failure must reach the operator"
+
+    ur.reset_transient_streak("job-connerr")
+    assert ur.prior_transient_streak("job-connerr") == 0
+    assert ur.hold_first_transient({}) is True

@@ -2649,6 +2649,9 @@ def run_job(
             + f"{_RESPONSE_FRAME}{len(logged_response)}\n{_RESPONSE_HEADING}{logged_response}{_RESPONSE_TERMINATOR}"
         )
         logger.info("Job '%s' completed successfully", job_name)
+        # A run that reached the model (success here) ends any transient-unreachable streak.
+        from cron.unreachable_retry import reset_transient_streak
+        reset_transient_streak(job_id)
         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
         return True, output, final_response, None
 
@@ -2659,9 +2662,17 @@ def run_job(
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
         # tail can schedule a bounded automatic re-run instead of waiting a full period.
         try:
-            from cron.unreachable_retry import is_model_unreachable_failure
+            from cron.unreachable_retry import (
+                STREAK_KEY, is_model_unreachable_failure, note_transient_failure,
+                reset_transient_streak,
+            )
             if is_model_unreachable_failure(e, agent):
                 job["_model_unreachable"] = True
+                # Count the streak: the delivery gate holds the FIRST such notice so one
+                # transient outage never pages the operator, while a repeat still alerts.
+                job[STREAK_KEY] = note_transient_failure(job_id)
+            else:
+                reset_transient_streak(job_id)
             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).
             from cron.quota_hold import hold_seconds_from_failure
@@ -3110,8 +3121,8 @@ def _save_compose_deliver(
         # (cron/unreachable_retry.py): hold the failure notice — the re-run either
         # delivers the real result or, once the ladder is exhausted, the next failure
         # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
-        from cron.unreachable_retry import will_retry
-        if will_retry(job):
+        from cron.unreachable_retry import hold_first_transient, will_retry
+        if will_retry(job) or hold_first_transient(job):
             d.should_deliver = False
             logger.info(
                 "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])

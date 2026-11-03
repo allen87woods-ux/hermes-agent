@@ -551,6 +551,18 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
     new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
         content, old_string, new_string, replace_all, correction_notes=correction_notes)
     if match_error:
+        # A re-sent edit that already landed (old_string == new_string, or the new
+        # text already present and the old gone) is a no-op, not a failure — mirror
+        # the file patch tool's already-applied handling so the model does not loop
+        # re-reading and re-patching. (RECURRING: 10-30 pearl-mining, 11-02 game-streaming.)
+        from tools.fuzzy_match import is_already_applied
+        if is_already_applied(content, old_string, new_string):
+            return {
+                "success": True,
+                "message": (f"No edit applied to '{target_label}' in skill '{name}': "
+                            f"the target text is already present (already-applied no-op)."),
+                "_change": {"old": _clip(old_string, 200, "…"), "new": _clip(new_string, 200, "…")},
+            }
         with suppress(Exception):
             from tools.fuzzy_match import format_no_match_hint
             match_error += format_no_match_hint(match_error, match_count, old_string, content)

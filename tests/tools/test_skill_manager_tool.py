@@ -809,7 +809,6 @@ Step 2: Do the other thing.
     @pytest.mark.parametrize("kwargs", [
         {"old_string": None, "new_string": "x"},
         {"old_string": "", "new_string": "x"},
-        {"old_string": "Step 1: Do the thing.", "new_string": "Step 1: Do the thing."},
     ])
     def test_rejected_patch_leaves_file_byte_identical(self, tmp_path, kwargs):
         """A rejected patch must not partially mutate the skill."""
@@ -821,6 +820,30 @@ Step 2: Do the other thing.
 
         assert result["success"] is False
         assert before == after, "rejected patch mutated the file"
+
+    def test_identical_old_new_present_is_noop_success(self, tmp_path):
+        """A re-sent edit whose old/new are identical AND already present is a no-op
+        success (already-applied), not a failure — prevents the model looping on a
+        landed edit (RECURRING 10-30 pearl-mining, 11-02 game-streaming)."""
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", self.CONTENT)
+            before = (tmp_path / "my-skill" / "SKILL.md").read_text()
+            result = json.loads(skill_manage(action="patch", name="my-skill",
+                                             old_string="Step 1: Do the thing.",
+                                             new_string="Step 1: Do the thing."))
+            after = (tmp_path / "my-skill" / "SKILL.md").read_text()
+
+        assert result["success"] is True, f"identical no-op should succeed, got {result}"
+        assert before == after, "no-op must not mutate the file"
+
+    def test_identical_old_new_absent_still_errors(self, tmp_path):
+        """Identical old/new where the text is NOT present is a genuine error."""
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", self.CONTENT)
+            result = json.loads(skill_manage(action="patch", name="my-skill",
+                                             old_string="def not_here_function():",
+                                             new_string="def not_here_function():"))
+        assert result["success"] is False
 
 
     def test_empty_new_string_still_deletes(self, tmp_path):

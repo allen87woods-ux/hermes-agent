@@ -396,6 +396,77 @@ def _resolve_local_cdp(env: dict, task_id: Optional[str], session_name: str = ""
     return err
 
 
+# --- On-demand local browser start -------------------------------------------------
+# A reap (browser-idle-reaper.sh) or a reboot leaves the persistent :9222 Chrome closed, and the
+# harness then fails the whole call with "CDP WS handshake failed … Connect call failed". Allen
+# declined BOOT autostart (2026-10-06): a browser resident from boot costs resources. This is the
+# other half of that decision — the agent starts it when a call actually needs it. One loopback TCP
+# probe per call, launch only when the connect is refused. Disable with
+# HERMES_BROWSER_AUTOSTART=0; point HERMES_BROWSER_START_SCRIPT at a different launcher.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_BROWSER_START_TIMEOUT_S = 60.0
+_BROWSER_READY_TIMEOUT_S = 20.0
+
+
+def _loopback_cdp_target(cdp: str) -> Optional[tuple[str, int]]:
+    """``(host, port)`` when ``cdp`` points at THIS machine's loopback, else None."""
+    raw = (cdp or "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(raw if "://" in raw else f"ws://{raw}")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    if host not in _LOOPBACK_HOSTS:
+        return None
+    return (host, int(port or (443 if parsed.scheme in ("https", "wss") else 80)))
+
+
+def _port_open(host: str, port: int) -> bool:
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_loopback_browser(cdp: str) -> None:
+    """Start the on-demand local Chrome when a loopback CDP endpoint is closed. Never raises.
+
+    Only loopback endpoints are eligible: a remote/cloud CDP URL must never cause a local launch.
+    """
+    try:
+        if not is_truthy_value(os.environ.get("HERMES_BROWSER_AUTOSTART", "1")):
+            return
+        target = _loopback_cdp_target(cdp)
+        if not target:
+            return
+        host, port = target
+        if _port_open(host, port):
+            return
+        script = os.environ.get("HERMES_BROWSER_START_SCRIPT", "").strip() or str(
+            get_hermes_home() / "scripts" / "start_browser.sh")
+        if not os.path.isfile(script):
+            logger.debug("browser_exec: %s:%s closed and no launcher at %s", host, port, script)
+            return
+        logger.info("browser_exec: %s:%s closed — starting the local browser (%s)", host, port, script)
+        subprocess.run(["bash", script], capture_output=True,
+                       timeout=_BROWSER_START_TIMEOUT_S, check=False)
+        deadline = time.monotonic() + _BROWSER_READY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if _port_open(host, port):
+                logger.info("browser_exec: local browser ready on %s:%s", host, port)
+                return
+            time.sleep(0.5)
+        logger.warning("browser_exec: local browser did not answer on %s:%s after start", host, port)
+    except Exception as exc:  # health: allow BLE001 -- a failed autostart must never break the call
+        logger.warning("browser_exec: on-demand browser start failed (non-fatal): %s", exc)
+
+
 def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = "",
                          force_local_sidecar: bool = False) -> Optional[str]:
     """Point the harness at the configured backend's CDP endpoint; error string on failure.
@@ -420,6 +491,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     from tools.browser_session_cloud import get_cloud_provider
     override = _quiet(get_cdp_override, "")
     if override:
+        _ensure_loopback_browser(override)
         _set_cdp_env(env, override)
         return None
     if force_local_sidecar:

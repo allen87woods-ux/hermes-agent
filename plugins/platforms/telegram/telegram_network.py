@@ -277,7 +277,15 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 if self._sticky_ip is _UNSET or self._sticky_ip != ip:
                     async with self._sticky_lock:
                         if self._sticky_ip is _UNSET or self._sticky_ip != ip:
-                            self._sticky_ip = ip
+                            # NEVER pin the dual-stack hostname (2026-11-12, DSA F1 x9). A hostname
+                            # success used to make `api.telegram.org` sticky, and _attempt_order()
+                            # then put it FIRST on the next request — the exact blackholed-AAAA path
+                            # #87015 exists to avoid. That is why gateway.log carries hostname-sticky
+                            # flap lines at all (3 of the last 5 samples). Only an IPv4 literal may
+                            # be sticky; the hostname stays a last-resort tail entry, and a hostname
+                            # success leaves the sticky slot UNSET (not None == "sticky hostname").
+                            if ip is not None:
+                                self._sticky_ip = ip
                             if ip is not None:
                                 log = logger.warning if last_error is not None else logger.info
                                 log("[Telegram] Using sticky IPv4 Telegram API path %s (dual-stack hostname tried last — #87015)", ip)

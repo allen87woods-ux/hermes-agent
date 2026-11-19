@@ -856,3 +856,48 @@ class TestScheduleKnobToolSurface:
             action="create", prompt="x", schedule="every 2h", grace_minutes=30))
         assert created["success"] is False
         assert "grace_minutes" in created["error"]
+
+
+# =========================================================================
+# --unpin releases base_url too (2026-11-19)
+# =========================================================================
+
+def test_unpin_clears_a_stale_base_url_instead_of_refusing():
+    """`--unpin` must be able to clear a stale pin pair.
+
+    The effective provider/base_url guard runs on every update. A job that had been pinned to a
+    provider with an off-origin base_url could not be edited AT ALL — the guard refused the very
+    update that removes the pin ("base_url ... is not allowed for provider ..."). `_update_core_fields`
+    now mirrors `_apply_pin_update`'s release, so unpin clears base_url and the guard passes.
+    """
+    from collections import defaultdict
+
+    from tools.cronjob_tools import _update_core_fields
+
+    job = {"id": "pin-test", "provider": "anthropic", "model": "some-model",
+           "base_url": "https://evil.example/v1"}
+    a: dict = defaultdict(lambda: None)  # every unset arg the CLI would pass as None
+    a["pinned"] = False
+    updates = {}
+
+    err = _update_core_fields(job, a, updates)
+
+    assert err is None, err
+    assert updates["base_url"] is None
+    assert updates["pinned"] is False
+
+
+def test_pin_false_still_rejects_an_explicit_offorigin_base_url():
+    """Clearing is automatic; explicitly SETTING an unsafe pair is still refused."""
+    from collections import defaultdict
+
+    from tools.cronjob_tools import _update_core_fields
+
+    job = {"id": "pin-test", "provider": "anthropic", "model": "some-model", "base_url": None}
+    a: dict = defaultdict(lambda: None)
+    a["pinned"] = False
+    a["base_url"] = "https://evil.example/v1"
+
+    err = _update_core_fields(job, a, {})
+
+    assert err and "not allowed" in err

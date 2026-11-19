@@ -894,6 +894,11 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     if a["interpreter"] is not None:
         # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
         updates["interpreter"] = a["interpreter"]
+    if a["pinned"] is False and "base_url" not in updates:
+        # update_job's _apply_pin_update releases base_url on unpin (2026-11-19). Mirror it here,
+        # or the effective-pair check below refuses the very update that clears a stale pin
+        # ("base_url ... is not allowed for provider ...") and --unpin can never land.
+        updates["base_url"] = None
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.

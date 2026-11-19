@@ -167,7 +167,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     _pin.add_argument("--pin", dest="pinned", action="store_true", default=None,
         help="Lock the CURRENT main agent model (and its provider) onto this job.")
     _pin.add_argument("--unpin", dest="pinned", action="store_false",
-        help="Release the job's model pin so it follows the main agent model again.")
+        help="Release the job's model pin (provider, model AND base_url) so it "
+             "follows the main agent model again.")
     cron_edit.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.")
     cron_edit.add_argument("--reasoning-effort", dest="reasoning_effort",

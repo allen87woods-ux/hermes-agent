@@ -1048,6 +1048,12 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
         exit_code = data.get("exit_code") if isinstance(data, dict) else None
         if exit_code is None or exit_code == 0:
             return False, ""
+        # Some non-zero exits are not failures, and the tool says so itself
+        # (`grep`/`rg` exit 1 = no matches -> "No matches found (not an error)").
+        # Counting them inflated the audit digest's errs column by ~7/day
+        # (DSA 2026-11-17 F1, RECURRING x5 - prompt pins could not reach this branch).
+        if str(data.get("exit_code_meaning", "")).endswith("(not an error)"):
+            return False, ""
         if data.get("status") == "degraded":
             return True, _degraded_suffix(data)
         err_msg = data.get("error")

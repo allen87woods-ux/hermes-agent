@@ -40,6 +40,46 @@ logger = logging.getLogger(__name__)
 # supervisor thread and warnings forever for the latter.
 MAX_POST_ATTACH_RECONNECT_FAILURES = 5
 
+# Remedy printed when the endpoint is simply gone. The audit trail on 2026-11-17 showed five
+# blind reconnects (08:47:17-08:47:32) against a Chrome that had already exited, and the final
+# error named no way out - the fix existed only in the browser-automation skill.
+CDP_START_BROWSER_HINT = "~/.hermes/scripts/start_browser.sh"
+
+
+async def _cdp_endpoint_alive(cdp_url: str) -> bool:
+    """True when the CDP endpoint still answers ``/json/version``.
+
+    A local Chrome that has exited is gone for good: retrying the WebSocket cannot bring it
+    back, so the supervisor checks the endpoint once and stops with a remedy instead.
+    Any probe failure (refused, timeout, non-200) counts as dead.
+    """
+    import urllib.request
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(cdp_url)
+    except ValueError:
+        return True  # unparseable: let the caller keep its existing retry behaviour
+    if not parts.netloc:
+        return True  # not a host:port endpoint (e.g. a pipe) - same fallback
+    # Only a LOCAL endpoint can be declared dead. A cloud provider's /json/version may 404 or
+    # demand auth, and Browserbase does drop sockets transiently - both must keep the retry
+    # budget, so anything non-loopback answers True without a probe.
+    host = (parts.hostname or "").lower()
+    if not (host in ("localhost", "::1") or host.startswith("127.")):
+        return True
+    scheme = "https" if parts.scheme in ("wss", "https") else "http"
+    probe = urlunsplit((scheme, parts.netloc, "/json/version", "", ""))
+
+    def _get() -> bool:
+        try:
+            with urllib.request.urlopen(probe, timeout=3) as resp:  # noqa: S310 - loopback probe
+                return getattr(resp, "status", 0) == 200
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_get)
+
 
 def _redact_cdp_error_text(exc: object) -> str:
     """Redact CDP endpoint credentials from an exception's (or URL's) string form.
@@ -381,6 +421,15 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, **connect_kwargs), timeout=10.0)
             except Exception as e:
                 if self._fail_start(e):
+                    return
+                if reconnect_failures == 0 and not await _cdp_endpoint_alive(self.cdp_url):
+                    logger.warning(
+                        "CDP supervisor %s: no endpoint answering at %s - the browser is not "
+                        "running. Start it with `%s`, then retry (stopped after 1 probe, "
+                        "not retrying).",
+                        self.task_id, self.cdp_url, CDP_START_BROWSER_HINT)
+                    if SUPERVISOR_REGISTRY.get(self.task_id) is self:
+                        SUPERVISOR_REGISTRY._pop(self.task_id)
                     return
                 reconnect_failures += 1
                 if self._reconnect_budget_spent(reconnect_failures, e):

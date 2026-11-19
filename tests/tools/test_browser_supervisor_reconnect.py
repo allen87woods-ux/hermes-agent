@@ -27,7 +27,7 @@ def unregister():
 def test_post_attach_reconnects_stop_at_budget_and_unregister(monkeypatch, unregister, caplog):
     """After the first attach, a dead endpoint gets MAX_POST_ATTACH_RECONNECT_FAILURES dials,
     one final warning, and the supervisor leaves the registry — never an unbounded loop."""
-    supervisor = bs.CDPSupervisor(task_id="bounded-reconnect", cdp_url="ws://127.0.0.1:9222")
+    supervisor = bs.CDPSupervisor(task_id="bounded-reconnect", cdp_url="ws://cdp.example.test:9222")
     bs.SUPERVISOR_REGISTRY._by_task[supervisor.task_id] = supervisor
     unregister.append(supervisor.task_id)
     budget = bs.MAX_POST_ATTACH_RECONNECT_FAILURES
@@ -62,6 +62,41 @@ def test_post_attach_reconnects_stop_at_budget_and_unregister(monkeypatch, unreg
     final = [r.getMessage() for r in caplog.records if "stopped after" in r.getMessage()]
     assert len(final) == 1 and f"{budget} failed reconnect" in final[0]
     assert supervisor.snapshot().active is False
+    assert bs.SUPERVISOR_REGISTRY.get(supervisor.task_id) is None
+
+
+def test_dead_local_endpoint_stops_after_one_probe(monkeypatch, unregister, caplog):
+    """A local Chrome that exited cannot be reconnected: ONE /json/version probe, a warning that
+    names the start script, and no retry storm (2026-11-17 audit F6 - five blind dials)."""
+    supervisor = bs.CDPSupervisor(task_id="dead-local", cdp_url="ws://127.0.0.1:9222")
+    bs.SUPERVISOR_REGISTRY._by_task[supervisor.task_id] = supervisor
+    unregister.append(supervisor.task_id)
+    dials = 0
+
+    async def connect(*_args, **_kwargs):
+        nonlocal dials
+        dials += 1
+        if dials == 1:
+            return _ClosingWebSocket()
+        raise ConnectionError("CDP endpoint is gone")
+
+    async def _noop(*_a, **_k):
+        pass
+
+    async def _dead(_url):
+        return False
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(supervisor, "_attach_initial_page", _noop)
+    monkeypatch.setattr(supervisor, "_read_loop", _noop)
+    monkeypatch.setattr(bs, "_cdp_endpoint_alive", _dead)
+
+    with caplog.at_level("WARNING", logger="tools.browser_supervisor"):
+        asyncio.run(asyncio.wait_for(supervisor._run(), timeout=2.0))
+
+    assert dials == 2  # initial attach + one dial after which the endpoint is declared dead
+    warns = [r.getMessage() for r in caplog.records if "browser is not running" in r.getMessage()]
+    assert len(warns) == 1 and bs.CDP_START_BROWSER_HINT in warns[0]
     assert bs.SUPERVISOR_REGISTRY.get(supervisor.task_id) is None
 
 

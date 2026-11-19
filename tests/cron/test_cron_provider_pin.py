@@ -202,8 +202,14 @@ class TestPinnedLocksTheMainModel:
         (tmp_path / "config.yaml").write_text("model:\n  default: newer-model\n")
         assert jobs.update_job(locked["id"], {"name": "renamed"})["model"] == "main-model"
 
-        released = jobs.update_job(locked["id"], {"pinned": False})
-        assert (released["model"], released["provider"]) == (None, None)
+        # A pin that carried an explicit endpoint releases it too (2026-11-19): leaving base_url
+        # behind kept the job pointed at the dead pinned host after --unpin, which is the whole
+        # thing the unpin was meant to release.
+        repinned = jobs.update_job(locked["id"], {"pinned": True, "base_url": "https://stale.invalid/v1"})
+        assert repinned["base_url"] == "https://stale.invalid/v1"
+
+        released = jobs.update_job(repinned["id"], {"pinned": False})
+        assert (released["model"], released["provider"], released["base_url"]) == (None, None, None)
 
     def test_pinned_never_overrides_an_explicit_model(self, monkeypatch, tmp_path):
         jobs, resolver = self._store(monkeypatch, tmp_path)

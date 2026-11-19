@@ -2020,8 +2020,15 @@ def _reject_terminal_activation(job: dict[str, Any], updated: dict[str, Any], jo
 
 def _apply_pin_update(job: dict[str, Any], updates: dict[str, Any]) -> None:
     """``pinned`` is not stored; it rewrites the per-job pin. ``True`` with no explicit model locks
-    the main agent's current provider+model onto the job, ``False`` releases both so the job follows
-    the main model again (an explicit ``model`` in the same update wins over either)."""
+    the main agent's current provider+model onto the job, ``False`` releases all three pin fields
+    (provider, model, base_url) so the job follows the main model again (an explicit ``model`` in
+    the same update wins over either).
+
+    ``base_url`` is a pin field too (see PIN_FIELDS in scripts/cron_alert_coverage.py): a job left
+    pointing at an old pinned endpoint keeps retrying a dead host even after ``--unpin``, which is
+    exactly what the unpin was meant to release. Cleared on both directions unless the caller
+    passes one explicitly.
+    """
     if "pinned" not in updates:
         return
     pinned = bool(updates.pop("pinned"))
@@ -2030,8 +2037,14 @@ def _apply_pin_update(job: dict[str, Any], updates: dict[str, Any]) -> None:
     if pinned:
         if not _normalize_job_optional_text(job.get("model")):
             updates["provider"], updates["model"] = _main_model_pin()
+        # A leftover custom endpoint from an earlier pin would override the provider just
+        # resolved, so the pin drops it.
+        if "base_url" not in updates:
+            updates["base_url"] = None
     else:
         updates["provider"], updates["model"] = None, None
+        if "base_url" not in updates:
+            updates["base_url"] = None
 
 
 def _normalize_job_updates(job: dict[str, Any], updates: dict[str, Any]) -> None:

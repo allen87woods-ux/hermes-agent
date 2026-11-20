@@ -424,10 +424,15 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     See #25752.
     """
     cron_cfg = (cfg or {}).get("cron") or {}
+    # ``code_execution`` (the ``execute_code`` tool) is hard-blocked inside cron runs — there is no
+    # user present to approve arbitrary local Python — so the tool can only ever waste a call.
+    # Strip it at dispatch instead of teaching every job prompt not to try (DSA 2026-11-20 F1,
+    # same failure recurred 09-10 / 09-20 / 11-19 / 11-20). Interactive sessions keep it.
+    base = ["messaging", "clarify", "code_execution"]
     if cron_cfg.get("allow_agent_scheduling"):
-        disabled = ["messaging", "clarify"]
+        disabled = list(base)
     else:
-        disabled = ["cronjob", "messaging", "clarify"]
+        disabled = ["cronjob", *base]
     agent_cfg = (cfg or {}).get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 

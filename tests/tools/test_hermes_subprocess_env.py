@@ -136,6 +136,11 @@ class TestTierInvariants:
         assert {"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
                 "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET"} <= _ALWAYS_STRIP_KEYS
 
+    def test_tier1_covers_webui_auth_secrets(self):
+        """The web-UI login password and passkey are the agent's own service credentials:
+        no terminal child needs them, and both are live login material."""
+        assert {"HERMES_WEBUI_PASSWORD", "HERMES_WEBUI_PASSKEY"} <= _ALWAYS_STRIP_KEYS
+
 
 class TestBrowserPassthroughPattern:
     def test_browser_keys_recoverable_after_strip(self):

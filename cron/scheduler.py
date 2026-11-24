@@ -425,10 +425,15 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     See #25752.
     """
     cron_cfg = (cfg or {}).get("cron") or {}
+    # ``code_execution`` (the ``execute_code`` tool) is hard-blocked inside cron runs — there is no
+    # user present to approve arbitrary local Python — so the tool can only ever waste a call.
+    # Strip it at dispatch instead of teaching every job prompt not to try (DSA 2026-11-20 F1,
+    # same failure recurred 09-10 / 09-20 / 11-19 / 11-20). Interactive sessions keep it.
+    base = ["messaging", "clarify", "code_execution"]
     if cron_cfg.get("allow_agent_scheduling"):
-        disabled = ["messaging", "clarify"]
+        disabled = list(base)
     else:
-        disabled = ["cronjob", "messaging", "clarify"]
+        disabled = ["cronjob", *base]
     agent_cfg = (cfg or {}).get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 
@@ -2453,6 +2458,9 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         max_iterations=setup.max_iterations,
+        # Per-job physical output cap (e.g. {"max_tokens": 6000}) — guards against runaway
+        # single-generation output on long-running jobs. Absent/None = provider default.
+        max_tokens=job.get("max_tokens"),
         reasoning_config=setup.reasoning_config,
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,
@@ -2587,6 +2595,9 @@ def run_job(
             + f"{_RESPONSE_FRAME}{len(logged_response)}\n{_RESPONSE_HEADING}{logged_response}{_RESPONSE_TERMINATOR}"
         )
         logger.info("Job '%s' completed successfully", job_name)
+        # A run that reached the model (success here) ends any transient-unreachable streak.
+        from cron.unreachable_retry import reset_transient_streak
+        reset_transient_streak(job_id)
         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
         return True, output, final_response, None
 
@@ -2602,9 +2613,17 @@ def run_job(
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
         # tail can schedule a bounded automatic re-run instead of waiting a full period.
         try:
-            from cron.unreachable_retry import is_model_unreachable_failure
+            from cron.unreachable_retry import (
+                STREAK_KEY, is_model_unreachable_failure, note_transient_failure,
+                reset_transient_streak,
+            )
             if is_model_unreachable_failure(e, agent):
                 job["_model_unreachable"] = True
+                # Count the streak: the delivery gate holds the FIRST such notice so one
+                # transient outage never pages the operator, while a repeat still alerts.
+                job[STREAK_KEY] = note_transient_failure(job_id)
+            else:
+                reset_transient_streak(job_id)
             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).
             from cron.quota_hold import hold_seconds_from_failure
@@ -3042,8 +3061,8 @@ def _save_compose_deliver(
         # (cron/unreachable_retry.py): hold the failure notice — the re-run either
         # delivers the real result or, once the ladder is exhausted, the next failure
         # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
-        from cron.unreachable_retry import will_retry
-        if will_retry(job):
+        from cron.unreachable_retry import hold_first_transient, will_retry
+        if will_retry(job) or hold_first_transient(job):
             d.should_deliver = False
             logger.info(
                 "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])

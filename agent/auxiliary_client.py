@@ -8206,6 +8206,10 @@ async def _async_call_llm_impl(
     # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()). (PR #16587)
     resp, exc = await _aoutcome(_primary())
     if exc is None:
+        if task == "vision":
+            # Spend visibility: paid vision primary (deepseek) is otherwise
+            # silent on success (09-23). One greppable line per call.
+            logger.info("Auxiliary vision served by %s (%s)", request_provider, req.final_model)
         return resp
     failure = _primary_failure(req, exc)
     # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
@@ -8214,6 +8218,8 @@ async def _async_call_llm_impl(
                     "once on the same provider before fallback: %s", task or "call", failure.error)
         resp, exc = await _aoutcome(_primary())
         if exc is None:
+            if task == "vision":
+                logger.info("Auxiliary vision served by %s (%s)", request_provider, req.final_model)
             return resp
         failure = _primary_failure(req, exc)
 

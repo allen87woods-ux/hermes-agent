@@ -216,7 +216,7 @@ class _SessionDB:
                 )
             self._target = _scope_of(db_path)
         self.read_only = read_only
-        self._lock = _threading.Lock()
+        self._lock = _threading.RLock()
         self._calls = 0
         self._closed = False
         self._reference: Optional[_weakref.finalize] = None

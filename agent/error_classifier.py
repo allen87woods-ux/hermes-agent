@@ -110,7 +110,11 @@ class ClassifiedError:
 # The Nous gateway's own words for "the free tier will not serve this" — a billing wall for a
 # named account, the tier refusing for an anonymous one (see ``_WELCOME_403_NAMED_PATTERNS``).
 _FREE_TIER_REFUSAL_PATTERNS = (
-    "model_not_supported_on_free_tier", "not available on the free tier", "isn't available on the free tier")
+    "model_not_supported_on_free_tier", "not available on the free tier", "isn't available on the free tier",
+    # OpenRouter free-tier delisting (09-23, ling-3.0-flash-vl:free -> 404 "This model is
+    # unavailable for free. The paid version is available now"): without these the 404 reads as
+    # a generic error and the explicit-provider gate dead-ends instead of walking the chain.
+    "unavailable for free", "paid version is available")
 _BILLING_PATTERNS = (
     "insufficient credits", "insufficient_quota", "insufficient balance", "credit balance",
     "credits exhausted", "credits have been exhausted", "requires available credits",

@@ -33,6 +33,16 @@ _TRANSIENT_OSERROR_NEEDLES = _DNS_FAILURE_NEEDLES + (
     "temporary failure in name resolution", "network is unreachable")
 _TRANSIENT_HTTP_NEEDLES = _TRANSIENT_OSERROR_NEEDLES + (
     "failed to resolve", "connection refused", "timed out", "timeout")
+# Provider transports lose their type before the scheduler sees them: run_agent puts the raw
+# message in result["error"] and _final_response_from_result re-raises it as a bare
+# RuntimeError("Connection error."), so there is no APIConnectionError left to match on. The
+# needles below are therefore message-based. Callers gate them on zero completed API calls
+# (cron/unreachable_retry.is_model_unreachable_failure), which keeps a mid-run tool failure
+# from being misread as "the model was never reached".
+_TRANSIENT_TRANSPORT_NEEDLES = (
+    "connection error", "connection reset", "connection aborted", "connection refused",
+    "server disconnected", "remote end closed connection", "read timeout", "connect timeout",
+    "operation timed out", "temporarily unavailable")
 _TRANSIENT_ERRNOS = frozenset({
     errno.ECONNREFUSED, errno.ECONNRESET, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN,
     errno.ETIMEDOUT, errno.EAGAIN})
@@ -72,6 +82,9 @@ def _is_transient_provider_resolve_error(exc: BaseException) -> bool:
                 return True
         # Bare exceptions that carry the raw DNS text (format_runtime_provider_error).
         if any(needle in msg for needle in _DNS_FAILURE_NEEDLES):
+            return True
+        # Transport failures whose exception type did not survive the cron wrapper.
+        if any(needle in msg for needle in _TRANSIENT_TRANSPORT_NEEDLES):
             return True
         cur = cur.__cause__ or cur.__context__
     return False

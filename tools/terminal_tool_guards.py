@@ -400,26 +400,67 @@ def _starts_long_lived_server(unquoted: str) -> bool:
     return any(_names_a_server(text) and not command.excused(index) for index, text in enumerate(command.texts))
 
 
-# Ordered (predicate on the unquoted command, guidance) — first hit wins.
-_FOREGROUND_GUIDANCE = (
+# Kinds returned by ``_foreground_background_verdict``.
+#
+# ``shell_bg`` / ``amp_bg`` name a command the tool cannot rewrite safely: a detached
+# ``cmd &`` would start a tracked shell that exits at once while its payload runs
+# untracked, so those stay refusals.
+#
+# ``long_lived`` names a plain server/watch invocation that needs no rewrite at all. The
+# caller wanted a tracked process; refusing it only bought a mechanical retry, and the
+# caller cannot see that its own emitted call omitted ``background``. Refusing therefore
+# repeated identically until the identical-call guardrail killed the run, so this kind is
+# promoted to a background session instead (mirroring the over-cap-timeout promotion).
+GUIDANCE_SHELL_BG = "shell_bg"
+GUIDANCE_AMP_BG = "amp_bg"
+GUIDANCE_LONG_LIVED = "long_lived"
+
+# Launchers that return to the shell immediately: a server started THROUGH one of these never
+# occupies the foreground, so it must not be classified as a long-lived foreground command.
+_SELF_DETACHING_LAUNCHER_RE = re.compile(
+    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)\s*(?:systemd-run|start-stop-daemon)\b",
+    re.IGNORECASE,
+)
+
+
+def _long_lived_foreground_hit(command: str) -> bool:
+    """True when *command* would itself block on a long-lived server/watch process.
+
+    Wraps the segment analyzer in ``_starts_long_lived_server`` — which excuses data
+    commands that merely mention a server name — and adds the launcher carve-out: promoting
+    on a raw substring promoted a whole compound wholesale (observed 2026-09-18: a
+    ``systemd-run … python -m http.server`` verification compound was backgrounded in
+    full, discarding the checks that followed it).
+    """
+    if _SELF_DETACHING_LAUNCHER_RE.search(command):
+        return False
+    return _starts_long_lived_server(command)
+
+
+# Ordered (predicate on the unquoted command, kind, guidance) — first hit wins.
+_FOREGROUND_GUIDANCE: tuple[tuple[Any, str, str], ...] = (
     (
         _SHELL_LEVEL_BACKGROUND_RE.search,
-        "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
-        "Re-send WITHOUT the wrapper as terminal(command=\"<cmd>\", background=true, "
-        "notify_on_complete=true) so Hermes tracks the process, then run readiness "
-        "checks and tests in separate commands.",
+        GUIDANCE_SHELL_BG,
+        "This call arrived without \"background\": true, and the command uses shell-level "
+        "background wrappers (nohup/disown/setsid). Re-send WITHOUT the wrapper as "
+        "terminal(command=\"<cmd>\", background=true, notify=true) so Hermes "
+        "tracks the process, then run readiness checks and tests in separate commands.",
     ),
     (
         lambda s: _INLINE_BACKGROUND_AMP_RE.search(s) or _TRAILING_BACKGROUND_AMP_RE.search(s),
-        "Foreground command uses '&' backgrounding. Re-send WITHOUT the '&' as "
-        "terminal(command=\"<cmd>\", background=true) — add notify_on_complete=true "
-        "for bounded jobs — then run health checks and tests in follow-up terminal calls.",
+        GUIDANCE_AMP_BG,
+        "This call arrived without \"background\": true, and the command uses '&' "
+        "backgrounding. Re-send WITHOUT the '&' as terminal(command=\"<cmd>\", "
+        "background=true) — add notify=true for bounded jobs — then run "
+        "health checks and tests in follow-up terminal calls.",
     ),
     (
-        _starts_long_lived_server,
-        "This foreground command appears to start a long-lived server/watch process. "
-        "Run it with background=true, verify readiness (health endpoint/log signal), "
-        "then execute tests in a separate command.",
+        _long_lived_foreground_hit,
+        GUIDANCE_LONG_LIVED,
+        "This command starts a long-lived server/watch process and the call did not set "
+        "\"background\": true, so it was started as a tracked background session instead "
+        "of being refused. Do NOT re-run it.",
     ),
 )
 
@@ -435,13 +476,28 @@ def _looks_like_help_or_version_command(command: str) -> bool:
     )
 
 
-def _foreground_background_guidance(command: str) -> str | None:
-    """Guidance text when a foreground command looks long-lived or uses shell
-    backgrounding (it should be a managed background session), else None."""
+def _foreground_background_verdict(command: str) -> tuple[str, str] | None:
+    """Classify a foreground command that must not run exactly as sent.
+
+    Returns ``(kind, guidance)`` where *kind* is one of the ``GUIDANCE_*``
+    constants, or None when the command may run in the foreground unchanged.
+    Callers promote ``GUIDANCE_LONG_LIVED`` to a background session; the other
+    kinds stay refusals because the command itself has to be rewritten.
+    """
     if _looks_like_help_or_version_command(command):
         return None
     unquoted = _strip_quotes(command)
-    return next((msg for hit, msg in _FOREGROUND_GUIDANCE if hit(unquoted)), None)
+    for hit, kind, msg in _FOREGROUND_GUIDANCE:
+        if hit(unquoted):
+            return kind, msg
+    return None
+
+
+def _foreground_background_guidance(command: str) -> str | None:
+    """Guidance text when a foreground command looks long-lived or uses shell
+    backgrounding (it should be a managed background session), else None."""
+    verdict = _foreground_background_verdict(command)
+    return verdict[1] if verdict else None
 
 
 # `&` spellings that are not backgrounding: and-lists, fd redirects (`2>&1`, `>&2`, `&>`, `&>>`,

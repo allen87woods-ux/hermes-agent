@@ -19,8 +19,10 @@ run that reaches the model — success or not — resets the ladder. Disable wit
 
 from __future__ import annotations
 
+import fcntl
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from cron.constants import is_recurring
@@ -37,6 +39,68 @@ RETRY_DELAYS_SECONDS: tuple[int, ...] = (300, 900, 1800)
 # expression it was planned under>}. Cleared by any run
 # that reached the model.
 STATE_KEY = "unreachable_retry"
+
+# Consecutive zero-API-call transient failures, persisted PER JOB so a streak survives
+# scheduler ticks, ladder resets and gateway restarts. One silent re-run per outage: the
+# first failure of a streak holds its notice, the second reaches the operator. Needed
+# because a job on a cadence shorter than the first rung (e.g. every 5 min vs 15) never
+# parks a ladder rung, so will_retry() cannot hold its notice.
+STREAK_FILENAME = "transient_streak"
+STREAK_KEY = "_transient_streak"  # in-memory mirror on the run's job dict
+
+
+def _streak_file(job_id: str) -> Path:
+    from cron.jobs import OUTPUT_DIR  # late: jobs imports this module's helpers
+
+    return Path(OUTPUT_DIR) / str(job_id) / STREAK_FILENAME
+
+
+def prior_transient_streak(job_id: str) -> int:
+    """Consecutive transient failures already recorded for *job_id* (0 = none)."""
+    try:
+        return int((_streak_file(job_id).read_text() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def note_transient_failure(job_id: str) -> int:
+    """Record one more consecutive zero-API-call transient failure; return the new count
+    (1 = this is the first of the streak). flock: two overlapping ticks must not read the
+    same count and both stay silent."""
+    path = _streak_file(job_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.seek(0)
+                count = int((fh.read() or "0").strip() or 0) + 1
+                fh.seek(0)
+                fh.truncate()
+                fh.write(str(count))
+                fh.flush()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return count
+    except (OSError, ValueError):
+        logger.warning(
+            "Job %s: could not record the transient-failure streak", job_id, exc_info=True)
+        return 1  # fail toward silence: the next failure still alerts
+
+
+def reset_transient_streak(job_id: str) -> None:
+    """A run that reached the model (any outcome) ends the streak."""
+    try:
+        _streak_file(job_id).unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Job %s: could not clear the transient-failure streak", job_id)
+
+
+def hold_first_transient(job: dict[str, Any]) -> bool:
+    """True when this model-unreachable failure is the FIRST of a streak, so its notice is
+    held for one silent re-run instead of paging. The caller gates on ``_model_unreachable``
+    (zero completed API calls), so a mid-run failure never reaches here."""
+    return int(job.get(STREAK_KEY) or 0) <= 1
 
 
 def retry_enabled(cfg: Optional[dict] = None) -> bool:

@@ -56,7 +56,9 @@ def test_trailing_amp_runs_as_tracked_background_through_the_same_guards(tmp_pat
     ("python3 -m http.server 8765 & curl -s localhost:8765", "'&' backgrounding"),
     ("sleep 1 & sleep 2 &", "'&' backgrounding"),
     ("nohup ./worker.sh > /dev/null 2>&1 &", "nohup/disown/setsid"),
-    ("python3 -m http.server 8765", "long-lived server"),
+    # A plain long-lived server is no longer refused: the local fork PROMOTES it to a tracked
+    # background session (see tests/tools/test_foreground_long_lived_promotion.py). Only the
+    # ambiguous/rewrite-requiring shapes above stay refusals.
     # Approval keys on the `&` here (gateway outside its service manager): no conversion.
     ("hermes gateway run &", "'&' backgrounding"),
 ])

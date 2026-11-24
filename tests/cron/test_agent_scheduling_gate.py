@@ -20,17 +20,22 @@ from cron.scheduler import _resolve_cron_disabled_toolsets
 
 
 # The toolsets that must be denied in cron context no matter what the
-# agent-scheduling gate says: messaging/clarify are interactive-only.
+# agent-scheduling gate says: messaging/clarify are interactive-only, and
+# code_execution (the execute_code tool) is hard-blocked inside cron runs anyway
+# (no user present to approve arbitrary local Python), so it can only waste a call.
 # ``memory`` is intentionally NOT here — cron agents get memory like any
 # other agent run.
-ALWAYS_DISABLED = ["messaging", "clarify"]
+ALWAYS_DISABLED = ["messaging", "clarify", "code_execution"]
 
 
 class TestGateOffDefault:
     def test_empty_config_denies_cronjob(self):
         assert _resolve_cron_disabled_toolsets({}) == [
-            "cronjob", "messaging", "clarify",
+            "cronjob", "messaging", "clarify", "code_execution",
         ]
+
+    def test_code_execution_stripped_with_gate_off(self):
+        assert "code_execution" in _resolve_cron_disabled_toolsets({})
 
 
 

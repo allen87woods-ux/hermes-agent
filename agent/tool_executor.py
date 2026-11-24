@@ -1173,6 +1173,13 @@ def _commit_tool_result(
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
+    tool_message = make_tool_result_message(
+        function_name,
+        _tool_content,
+        tool_call_id,
+        effect_disposition=effect_disposition,
+        tool_args=function_args,
+    )
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
     # A plugin that went live during this turn, and late LSP verdicts on this session's earlier edits,
     # are told on this new row (outside any untrusted-data wrapper).

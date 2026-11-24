@@ -42,6 +42,14 @@ _STATIC_PROVIDER_ENV_BLOCKLIST = DEPLOYMENT_STAMP_ENV | frozenset({
     "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS", "SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT",
     "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS", "SIGNAL_HOME_CHANNEL",
     "SIGNAL_HOME_CHANNEL_NAME", "SIGNAL_IGNORE_STORIES",
+    # Web-UI service auth (Agatha fork, 2026-09-29): the hermes-webui unit exports these into the
+    # agent process env for its own HTTP auth. No child needs them, and the tier-1 list ALONE IS NOT
+    # CONSULTED on the terminal spawn path (_filter_secret_env honours this blocklist + plugin strip
+    # keys only), so they belong here exactly like TELEGRAM_BOT_TOKEN/GH_TOKEN. Consistent with
+    # upstream practice: the critical names are listed in both places.
+    # HASS_TOKEN/HASS_URL intentionally NOT restored here — upstream removed them when the
+    # Home Assistant adapter moved out of core (the merge takes upstream's side).
+    "HERMES_WEBUI_PASSWORD", "HERMES_WEBUI_PASSKEY",
     "EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_IMAP_HOST", "EMAIL_SMTP_HOST",
     "EMAIL_HOME_ADDRESS", "EMAIL_HOME_ADDRESS_NAME", "HERMES_DASHBOARD_SESSION_TOKEN",
     # The dashboard PTY child's WS URLs carry that token (or the gated internal
@@ -651,6 +659,11 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     # child (credentialed CLIs included) consumes them.
     "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
     "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
+    # Web-UI auth secrets (Agatha fork, 2026-09-29): the hermes-webui unit exports these into the
+    # agent process env for its own HTTP auth, and the scrub did not know them — so every terminal
+    # child inherited a live UI login. No child needs them: the only scripts that use the password
+    # (archive_webui_*.py) read it from the env FILE, never from the process env.
+    "HERMES_WEBUI_PASSWORD", "HERMES_WEBUI_PASSKEY",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY",
 }) | _ADAPTER_SECRET_ENV | _left_core_env(secrets_only=True) | _secret_source_bootstrap_env() | DEPLOYMENT_STAMP_ENV

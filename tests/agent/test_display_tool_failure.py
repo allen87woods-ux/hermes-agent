@@ -80,6 +80,22 @@ class TestDetectToolFailureTerminal:
         assert is_failure is True
         assert suffix == " [exit 2]"
 
+    def test_annotated_non_error_exit_code_is_not_a_failure(self):
+        """`grep`/`rg` exit 1 means "no matches", and the tool annotates that in
+        exit_code_meaning. Counting it as a failure inflated the audit digest's error
+        column by ~7/day (DSA 11-17 F1, RECURRING x5)."""
+        result = json.dumps({
+            "output": "0",
+            "exit_code": 1,
+            "exit_code_meaning": "No matches found (not an error)",
+        })
+        assert _detect_tool_failure("terminal", result) == (False, "")
+
+    def test_unannotated_nonzero_exit_is_still_a_failure(self):
+        """The annotation is the exemption - a plain exit 1 stays a failure."""
+        is_failure, _ = _detect_tool_failure("terminal", json.dumps({"output": "", "exit_code": 1}))
+        assert is_failure is True
+
     def test_multimodal_envelope_dict_is_still_a_success(self):
         envelope = {"_multimodal": True, "content": [{"type": "text", "text": "screenshot taken"}]}
         assert _detect_tool_failure("browser_exec", envelope) == (False, "")
